@@ -155,6 +155,75 @@ def test_schemas_for_role_are_read_only():
         assert "read_profile" not in names              # profile is injected, not read
 
 
+# ----------------------------------------------- code-reviewer role (P8 #24)
+class FakeCode:
+    """Duck-typed CodeClient for the code-reviewer subagent."""
+
+    def __init__(self, status=200, body=None):
+        self._status, self._body, self.calls = status, body, []
+
+    async def sync(self, repo):
+        self.calls.append(("sync", repo)); return self._status, self._body
+
+    async def grep(self, repo, pattern, glob=None):
+        self.calls.append(("grep", repo, pattern, glob)); return self._status, self._body
+
+    async def file(self, repo, path):
+        self.calls.append(("file", repo, path)); return self._status, self._body
+
+    async def tree(self, repo):
+        self.calls.append(("tree", repo)); return self._status, self._body
+
+
+def test_spawn_subagent_enum_stays_in_sync_with_roster_roles():
+    # The schema enum is hand-duplicated (tools.py can't import roster — circular), so
+    # a role added to the roster must also be added to the enum. This guards the drift
+    # the review caught: code-reviewer was in the roster but missing from the enum.
+    schema = next(s for s in tools._CONTROL_SCHEMAS if s["function"]["name"] == "spawn_subagent")
+    enum = set(schema["function"]["parameters"]["properties"]["role"]["enum"])
+    assert enum == set(roster.ROLE_NAMES)
+    assert "code-reviewer" in enum
+
+
+def test_code_reviewer_role_exists_with_code_tools():
+    assert "code-reviewer" in roster.ROLE_NAMES
+    toolset = roster.ROLE_TOOLSETS["code-reviewer"]
+    assert {"sync_repo", "list_repo_tree", "code_search", "read_code"} <= toolset
+    # Its restricted catalog exposes those reads (+ finish), no writes.
+    names = {s["function"]["name"] for s in roster.schemas_for_role("code-reviewer")}
+    assert {"sync_repo", "code_search", "read_code", "list_repo_tree"} <= names
+    assert not (names & tools.WRITE_TOOLS)
+
+
+async def test_code_reviewer_dispatches_a_code_tool_through_the_client():
+    # The code_client threaded into run_subagent must reach the code tools.
+    code = FakeCode(200, {"repo": "me/agent", "head_sha": "deadbeefcafe", "files": 9, "bytes": 111})
+    infra = FakeInfra([
+        _completion(tool_calls=[_tool_call("sync_repo", '{"repo": "me/agent"}')]),
+        _completion(tool_calls=[_tool_call("finish_answer", '{"summary": "reviewed me/agent"}')]),
+    ])
+    out = await subagents.run_subagent(
+        task="Deeply review me/agent", role="code-reviewer",
+        infra_client=infra, dossier_client=FakeDossier(), code_client=code)
+    assert out == "reviewed me/agent"
+    assert code.calls == [("sync", "me/agent")]
+
+
+async def test_code_reviewer_cannot_call_a_tool_outside_its_role():
+    # search_applications is NOT in code-reviewer's toolset — refused, never dispatched.
+    code = FakeCode(200, {})
+    dossier = FakeDossier()
+    infra = FakeInfra([
+        _completion(tool_calls=[_tool_call("search_applications", "{}")]),
+        _completion(tool_calls=[_tool_call("finish_answer", '{"summary": "done"}')]),
+    ])
+    out = await subagents.run_subagent(
+        task="review", role="code-reviewer", infra_client=infra,
+        dossier_client=dossier, code_client=code)
+    assert out == "done"
+    assert not any(isinstance(c, tuple) and c[0] == "search_applications" for c in dossier.calls)
+
+
 # --------------------------------------------------- spawn intercept (in-loop)
 async def test_coach_delegates_then_continues():
     # coach spawns reviewer -> child finishes -> coach finishes. One shared FakeInfra

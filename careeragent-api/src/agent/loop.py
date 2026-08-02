@@ -372,7 +372,7 @@ def _is_parallel_read(tc: Dict[str, Any], mcp_client: Optional[MCPClient]) -> bo
 
 
 async def _dispatch_one_read(tc, mode, dossier_client, mcp_client, review_client, fetch_client=None,
-                             ats_client=None):
+                             ats_client=None, code_client=None):
     """Parse+coerce a read call's args and dispatch it. Returns (tc, name, args, ToolResult)."""
     fn = (tc or {}).get("function", {}) or {}
     name = fn.get("name", "")
@@ -392,7 +392,8 @@ async def _dispatch_one_read(tc, mode, dossier_client, mcp_client, review_client
         ok, text = await mcp_client.call(name, args)
         return tc, name, args, tools.ToolResult(ok, text)
     return tc, name, args, await tools.dispatch(
-        name, args, dossier_client, review_client, fetch_client, ats_client)
+        name, args, dossier_client, review_client, fetch_client, ats_client,
+        code_client=code_client)
 
 
 def _record_fetched(name: str, args: Dict[str, Any], result: Any, fetched_urls: Set[str]) -> None:
@@ -639,6 +640,7 @@ async def run_agent(
     ats_client: Any = None,
     render_client: Any = None,
     jobs_client: Any = None,
+    code_client: Any = None,
     reasoning_effort: Optional[str] = None,
     max_steps: int = DEFAULT_MAX_STEPS,
     grounding_enabled: bool = True,
@@ -921,7 +923,7 @@ async def run_agent(
                     continue
                 results = await asyncio.gather(*[
                     _dispatch_one_read(tc, mode, dossier_client, mcp_client, review_client,
-                                       fetch_client, ats_client)
+                                       fetch_client, ats_client, code_client)
                     for tc in tool_calls])
                 all_ok = True
                 for tc, name, cargs, res in results:
@@ -1199,6 +1201,7 @@ async def run_agent(
                             task=task, role=role, infra_client=infra_client,
                             dossier_client=dossier_client, profile_content=profile_content,
                             fetch_client=fetch_client, review_client=review_client,
+                            code_client=code_client,
                             max_steps=subagent_max_steps, effort=subagent_effort)
                     except Exception as err:
                         logger.warning("spawn_subagent(%s) failed: %s: %s",
@@ -1289,7 +1292,7 @@ async def run_agent(
                 else:
                     result = await tools.dispatch(
                         name, args, dossier_client, review_client, fetch_client,
-                        ats_client, render_client)
+                        ats_client, render_client, code_client=code_client)
 
                 yield _reasoning(f"   ↳ {'ok' if result.ok else 'blocked/error'}\n")
                 yield _typed("tool_result", name=name, ok=bool(result.ok))

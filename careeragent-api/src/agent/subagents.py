@@ -77,6 +77,7 @@ async def run_subagent(
     profile_content: str = "",
     fetch_client: Any = None,
     review_client: Any = None,
+    code_client: Any = None,
     max_steps: int = DEFAULT_SUBAGENT_MAX_STEPS,
     effort: str = DEFAULT_SUBAGENT_EFFORT,
 ) -> str:
@@ -147,7 +148,8 @@ async def run_subagent(
                 convo.append({"role": "tool", "tool_call_id": tc_id,
                               "content": f"Bad arguments — {arg_err}"})
                 continue
-            result = await tools.dispatch(name, args, dossier_client, review_client, fetch_client)
+            result = await tools.dispatch(name, args, dossier_client, review_client, fetch_client,
+                                          code_client=code_client)
             convo.append({"role": "tool", "tool_call_id": tc_id, "content": result.content})
 
         if finished is not None:

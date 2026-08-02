@@ -399,6 +399,7 @@ from agent import loop as agent_loop
 from agent.mcp_client import MCPClient
 from client.review import ReviewClient
 from client.fetch import FetchClient
+from client.code import CodeClient
 from client.ats import AtsClient
 from client.render import RenderClient
 from client.jobs import JobsClient
@@ -764,6 +765,14 @@ class Config:
     FETCH_API_KEY: str = os.environ.get("FETCH_API_KEY", "").strip()
     FETCH_ENABLED: bool = bool(FETCH_URL) and bool(FETCH_API_KEY)
 
+    # ----- careeragent-code (OPTIONAL) — deep code review workspace (P8 #24) -----
+    # When both are set, the coach gains read-only sync_repo / code_search /
+    # read_code / list_repo_tree tools that delegate to careeragent-code (a real
+    # local checkout). careeragent-code holds the GitHub PAT; the api stays PAT-less.
+    CODE_URL: str = os.environ.get("CODE_URL", "").strip().rstrip("/")
+    CODE_API_KEY: str = os.environ.get("CODE_API_KEY", "").strip()
+    CODE_ENABLED: bool = bool(CODE_URL) and bool(CODE_API_KEY)
+
     # ----- careeragent-ats (OPTIONAL) — artifacts: ATS keyword coverage (P7 #16) -----
     # When both are set (and the agent is on), the coach gains a read-only
     # `ats_score` tool that delegates to careeragent-ats: a deterministic
@@ -1089,6 +1098,7 @@ fetch_client: Optional[FetchClient] = None
 ats_client: Optional[AtsClient] = None
 render_client: Optional[RenderClient] = None
 jobs_client: Optional[JobsClient] = None
+code_client: Optional[CodeClient] = None
 sessions_client: Optional[SessionsClient] = None
 
 
@@ -1135,7 +1145,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     @app.on_event("startup") / @app.on_event("shutdown") pair.
     """
     global identity, infra_client, logger_client, memory_client, dossier_client, mcp_client, review_client
-    global fetch_client, ats_client, render_client, jobs_client, sessions_client
+    global fetch_client, ats_client, render_client, jobs_client, code_client, sessions_client
 
     # ------------------------------------------------------------------
     # 1. Banner
@@ -1408,6 +1418,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("careeragent-fetch not configured (FETCH_URL/FETCH_API_KEY unset); no fetch_url tool.")
 
     # ------------------------------------------------------------------
+    # 9d-quater. careeragent-code client (OPTIONAL) — deep code review (P8 #24), fail-soft
+    # ------------------------------------------------------------------
+    if config.AGENT_ENABLED and config.CODE_ENABLED:
+        try:
+            code_client = CodeClient(url=config.CODE_URL, api_key=config.CODE_API_KEY)
+            await code_client.start()
+            logger.info("CODE ENABLED (url=%s) — deep code-review tools available", config.CODE_URL)
+        except Exception as err:
+            logger.warning("careeragent-code unavailable (%s: %s) — running without code tools",
+                           type(err).__name__, err)
+            code_client = None
+    elif config.AGENT_ENABLED:
+        logger.info("careeragent-code not configured (CODE_URL/CODE_API_KEY unset); no deep code tools.")
+
+    # ------------------------------------------------------------------
     # 9d-ter. careeragent-ats client (OPTIONAL) — artifacts: ATS coverage (P7 #16), fail-soft
     # ------------------------------------------------------------------
     if config.AGENT_ENABLED and config.ATS_ENABLED:
@@ -1526,6 +1551,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await fetch_client.stop()
         except Exception as err:
             logger.warning(f"Error stopping FetchClient: {type(err).__name__}: {err}")
+
+    # Stop the CodeClient (careeragent-code boundary, P8 #24).
+    if code_client is not None:
+        try:
+            await code_client.stop()
+        except Exception as err:
+            logger.warning(f"Error stopping CodeClient: {type(err).__name__}: {err}")
 
     # Stop the AtsClient (careeragent-ats boundary, P7 #16).
     if ats_client is not None:
@@ -1949,6 +1981,7 @@ async def chat_endpoint(
                     ats_client=ats_client,
                     render_client=render_client,
                     jobs_client=jobs_client,
+                    code_client=code_client,
                     reasoning_effort=request.reasoning_effort,
                     max_steps=config.AGENT_MAX_STEPS,
                     grounding_enabled=config.GROUNDING_GATE_ENABLED,
