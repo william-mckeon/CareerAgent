@@ -20,16 +20,21 @@
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 import re
 import subprocess
+import urllib.error
+import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from safety import CodeProblem
 
 logger = logging.getLogger("careeragent-code")
+
+_GITHUB_API = "https://api.github.com"
 
 # git invoked with these -c overrides on EVERY call — the hardening above.
 _GIT_HARDENING = [
@@ -98,6 +103,52 @@ def _clone_url(repo: str) -> str:
 def head_sha(repo_dir: Path, timeout: float = 20.0) -> str:
     out = _run_git(["rev-parse", "HEAD"], timeout=timeout, cwd=repo_dir)
     return out.strip()
+
+
+def list_owner_repos(token: Optional[str], *, per_page: int = 100,
+                     max_pages: int = 5, timeout: float = 20.0) -> List[str]:
+    """Discover the authenticated user's OWNER repos via the GitHub REST API,
+    newest-pushed first, as ['owner/name', ...].
+
+    This is the ONE non-git use of the read-only PAT this box holds (ADR-011):
+    `git` can clone/pull a named repo but cannot LIST a user's repos, so a nightly
+    pre-sync needs this. The token rides an Authorization header (never a URL, never
+    logged, never returned). Raises CodeProblem on a hard failure (no token /
+    network / HTTP / malformed) so the caller can treat it as a total failure; the
+    error text carries only a status code, never the token."""
+    if not token:
+        raise CodeProblem(400, "no GitHub token configured — cannot discover repos")
+    full_names: List[str] = []
+    for page in range(1, max_pages + 1):
+        url = (f"{_GITHUB_API}/user/repos?affiliation=owner&sort=pushed"
+               f"&per_page={int(per_page)}&page={page}")
+        req = urllib.request.Request(url, headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "careeragent-code",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read()
+        except urllib.error.HTTPError as err:
+            raise CodeProblem(502, f"GitHub repo listing failed (HTTP {err.code})")
+        except (urllib.error.URLError, OSError) as err:
+            raise CodeProblem(502, f"GitHub repo listing failed: {type(err).__name__}")
+        try:
+            rows = json.loads(body)
+        except Exception:
+            raise CodeProblem(502, "GitHub repo listing returned malformed JSON")
+        if not isinstance(rows, list) or not rows:
+            break
+        for r in rows:
+            if isinstance(r, dict):
+                fn = r.get("full_name")
+                if isinstance(fn, str) and "/" in fn:
+                    full_names.append(fn)
+        if len(rows) < per_page:
+            break   # short page → last page
+    return full_names
 
 
 def clone_or_pull(repo: str, repo_dir: Path, token: Optional[str],

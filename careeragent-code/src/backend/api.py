@@ -15,6 +15,7 @@
 #   GET  /file   ?repo=&path=            → one file's text (size-capped, traversal-safe)
 #   GET  /tree   ?repo=                  → the file tree
 #   GET  /list                           → cached repos
+#   POST /refresh {limit?}               → nightly warm: discover + clone/pull owner repos (Slice E)
 #   GET  /health                         → {status, service}
 # ============================================================================
 
@@ -34,8 +35,8 @@ load_dotenv()
 
 from safety import CodeProblem  # noqa: E402
 from schemas import (  # noqa: E402
-    FileResponse, GrepRequest, GrepResponse, RepoInfo, SyncRequest, SyncResponse,
-    TreeResponse,
+    FileResponse, GrepRequest, GrepResponse, RefreshRequest, RefreshResponse,
+    RepoInfo, SyncRequest, SyncResponse, TreeResponse,
 )
 from security import verify_api_key  # noqa: E402
 from workspace import Workspace  # noqa: E402
@@ -68,6 +69,10 @@ class Config:
     MAX_GREP_MATCHES = _int_env("CODE_MAX_GREP_MATCHES", 200)
     MAX_CACHE_BYTES = _int_env("CODE_MAX_CACHE_BYTES", 2_000_000_000)
     MAX_REPO_BYTES = _int_env("CODE_MAX_REPO_BYTES", 500_000_000)
+    # Slice E — nightly warm bounds. REFRESH_BUDGET_BYTES 0 → default to 85% of the
+    # cache cap in Workspace (so a warm never evicts what it just warmed).
+    REFRESH_MAX_REPOS = _int_env("CODE_REFRESH_MAX_REPOS", 20)
+    REFRESH_BUDGET_BYTES = _int_env("CODE_REFRESH_BUDGET_BYTES", 0)
 
 
 config = Config()
@@ -83,6 +88,8 @@ async def lifespan(app: FastAPI):
         max_file_bytes=config.MAX_FILE_BYTES, max_tree_entries=config.MAX_TREE_ENTRIES,
         max_grep_matches=config.MAX_GREP_MATCHES, max_cache_bytes=config.MAX_CACHE_BYTES,
         max_repo_bytes=config.MAX_REPO_BYTES,
+        max_refresh_repos=config.REFRESH_MAX_REPOS,
+        refresh_budget_bytes=config.REFRESH_BUDGET_BYTES or None,
     )
     logger.info("=" * 60)
     logger.info("careeragent-code — the read-only code workspace")
@@ -91,6 +98,9 @@ async def lifespan(app: FastAPI):
     logger.info("caps           : file=%d tree=%d grep=%d cache=%d",
                 config.MAX_FILE_BYTES, config.MAX_TREE_ENTRIES,
                 config.MAX_GREP_MATCHES, config.MAX_CACHE_BYTES)
+    logger.info("refresh bounds : max_repos=%d budget_bytes=%s",
+                config.REFRESH_MAX_REPOS,
+                config.REFRESH_BUDGET_BYTES or "cache cap − per-repo cap")
     if not config.CODE_API_KEY:
         logger.warning("CODE_API_KEY is not set — the endpoints will 503.")
     logger.info("careeragent-code ready on :%s", config.PORT)
@@ -149,6 +159,18 @@ async def tree(repo: str = Query(...), api_key: str = Security(verify_api_key)):
 @app.get("/list", response_model=List[RepoInfo])
 async def list_repos(api_key: str = Security(verify_api_key)):
     return [RepoInfo(**r) for r in _ws().list_repos()]
+
+
+@app.post("/refresh", response_model=RefreshResponse)
+async def refresh(body: RefreshRequest, api_key: str = Security(verify_api_key)):
+    """Nightly warm (Slice E): discover the user's owner repos and clone/pull each,
+    bounded + fail-soft. Separate from the on-demand /sync path, which is untouched.
+    A discovery failure (no token / GitHub unreachable) → 4xx/5xx the caller retries;
+    a single bad repo is counted in `errors` and the sweep continues."""
+    try:
+        return RefreshResponse(**_ws().refresh(body.limit))
+    except CodeProblem as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
 
 
 @app.get("/health")

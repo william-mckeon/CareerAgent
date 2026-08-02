@@ -217,19 +217,27 @@ GitHub PAT into the coach.
 
 **Decision.** Add a dedicated **`careeragent-code`** box (port 8012) — the read-only code workspace:
 - **Clone-on-demand, cached.** `git clone --depth 1` / `pull` a repo into a capped LRU cache volume when
-  it is first reviewed; refresh (optionally via the #18b scheduler). NOT a full-account mirror.
+  it is first reviewed. The optional nightly REFRESH is now realized as **Slice E**: careeragent-jobs'
+  scheduler fires careeragent-code's `POST /refresh`, a BOUNDED (repo-count + byte-budget) fail-soft sweep
+  that warms the cache so the day's first review isn't a cold clone — on-demand pull stays authoritative,
+  the warm is a pure optimization. NOT a full-account mirror.
 - **Read-only, NO execution.** The box runs only `git` and `rg` with fixed argv (never a shell), and never
   runs anything FROM a cloned repo — no build, no git hooks (`core.hooksPath=/dev/null`), no submodule
   auto-init. Cloned code is DATA to read, never to run. It also never writes to the user's repos.
 - **PAT stays isolated.** The read-only GitHub PAT lives ONLY in this box (like the github-MCP caddy proxy)
   and is never returned; the coach stays PAT-less. File content the coach receives is fenced as untrusted
-  DATA (a repo can carry adversarial strings).
+  DATA (a repo can carry adversarial strings). **Slice E widens the PAT's mandate** from clone/pull-only to
+  ALSO discovering the user's owner repos via one GitHub REST call (`GET /user/repos`) — the discovery lives
+  HERE (its own PAT) rather than adding a github-MCP client to careeragent-jobs, so jobs/api stay PAT-less
+  (jobs → careeragent-code carries only `CODE_API_KEY`). The token is still never logged or returned
+  (discovery errors carry only a status code).
 - **Complementary, not a replacement.** The github-MCP stays for cheap lookups; `careeragent-review` stays
   the portfolio-card path; the workspace is the DEEP path only. This bounds strictly to read/review/
   portfolio/content — CareerAgent does not become a coding agent that edits or runs code.
 
-**Status.** Accepted for Phase 8 #24. A future "execute/build the cloned code" or "let the coach edit a
-repo" request is a drift signal — revisit here first.
+**Status.** Accepted for Phase 8 #24; amended for **Slice E** (nightly `/refresh` warm + the PAT's mandate
+widened to owner-repo discovery, still isolated in-box). A future "execute/build the cloned code" or "let the
+coach edit a repo" request is a drift signal — revisit here first.
 
 ---
 

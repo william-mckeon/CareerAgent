@@ -45,6 +45,8 @@ class Workspace:
         max_grep_matches: int = 200,
         max_cache_bytes: int = 2_000_000_000,
         max_repo_bytes: int = 500_000_000,
+        max_refresh_repos: int = 20,
+        refresh_budget_bytes: Optional[int] = None,
     ) -> None:
         self.root = Path(cache_root)
         self.root.mkdir(parents=True, exist_ok=True)
@@ -56,6 +58,15 @@ class Workspace:
         self.max_grep_matches = max_grep_matches
         self.max_cache_bytes = max_cache_bytes
         self.max_repo_bytes = max_repo_bytes
+        # Nightly-refresh bounds (Slice E). The sweep stops at whichever comes first —
+        # a repo count or a byte budget. The budget defaults to (cache cap − one repo
+        # ceiling) so that even the check-before-warm overshoot (one last repo up to
+        # max_repo_bytes) lands within the cap; it is clamped to the cap. Belt-and-
+        # suspenders: refresh() also protects warmed repos from end-of-sweep eviction,
+        # so no warmed repo is evicted even if this budget is misconfigured.
+        self.max_refresh_repos = max_refresh_repos
+        _budget = refresh_budget_bytes if refresh_budget_bytes else max(0, max_cache_bytes - max_repo_bytes)
+        self.refresh_budget_bytes = min(_budget, max_cache_bytes)
 
     # ---------------------------------------------------------------- paths
     def _repo_dir(self, repo: str) -> Path:
@@ -70,7 +81,11 @@ class Workspace:
         return d
 
     # ---------------------------------------------------------------- sync
-    def sync(self, repo: str) -> Dict[str, Any]:
+    def _sync_one(self, repo: str) -> tuple:
+        """Clone-or-pull ONE repo + measure + enforce the per-repo cap + mark used.
+        Does NOT enforce the GLOBAL cache cap — the caller decides when: sync() does
+        it once per call; refresh() does it once at the end of the whole sweep (so a
+        bounded warm never evicts a repo it warmed earlier in the same pass)."""
         repo = require_repo(repo)
         d = self._repo_dir(repo)
         existed = (d / ".git").exists()
@@ -83,9 +98,54 @@ class Workspace:
             raise CodeProblem(413, f"'{repo}' is too large to review ({byts} bytes; "
                                    f"cap {self.max_repo_bytes})")
         self._mark_used(d)
-        self._enforce_cache_cap(exclude=d)   # never evict the repo we just synced
         return {"repo": repo, "head_sha": head, "files": files, "bytes": byts,
-                "cached": existed}
+                "cached": existed}, d
+
+    def sync(self, repo: str) -> Dict[str, Any]:
+        result, d = self._sync_one(repo)
+        self._enforce_cache_cap(exclude=d)   # never evict the repo we just synced
+        return result
+
+    # ------------------------------------------------------------- refresh (Slice E)
+    def refresh(self, max_repos: Optional[int] = None) -> Dict[str, Any]:
+        """Nightly warm: DISCOVER the user's owner repos (newest-pushed first) and
+        clone-or-pull each, BOUNDED by a repo count and a byte budget so the sweep
+        can never exceed the cache and thus never evicts what it just warmed.
+
+        Fail-soft PER REPO: one bad/oversized/unreachable repo is counted in
+        ``errors`` and the sweep continues. A DISCOVERY failure (no token / GitHub
+        unreachable) raises CodeProblem — a TOTAL failure the caller (the nightly
+        job) treats as a retry. The on-demand sync() path is untouched; this only
+        pre-warms the cache."""
+        discovered = gitops.list_owner_repos(self._token, timeout=self.rg_timeout)
+        cap = (self.max_refresh_repos if max_repos is None
+               else min(int(max_repos), self.max_refresh_repos))
+        refreshed: List[str] = []
+        warmed_dirs: List[Path] = []
+        errors = 0
+        warmed_bytes = 0
+        for repo in discovered:
+            if len(refreshed) >= cap or warmed_bytes >= self.refresh_budget_bytes:
+                break                                  # bounded — leave the rest cold
+            try:
+                repo_v = require_repo(repo)            # untrusted API payload → validate
+                result, d = self._sync_one(repo_v)
+            except CodeProblem as exc:
+                errors += 1
+                logger.info("refresh: skipped %s (%s)", repo, getattr(exc, "detail", exc))
+                continue
+            refreshed.append(result["repo"])
+            warmed_dirs.append(d)
+            # Budget on FULL on-disk bytes (incl .git) — the SAME basis the cache cap
+            # measures — so the stop condition can't undercount and overrun the cap.
+            warmed_bytes += self._dir_bytes(d)
+        # Tidy the cache, but NEVER evict a repo we warmed this pass — so the sweep can
+        # never clone-then-evict its own work (invariant #3), only shed older repos.
+        self._enforce_cache_cap(exclude=warmed_dirs)
+        skipped = max(0, len(discovered) - len(refreshed) - errors)
+        return {"discovered": len(discovered), "refreshed": len(refreshed),
+                "skipped": skipped, "errors": errors, "repos": refreshed,
+                "bytes": warmed_bytes}
 
     # ---------------------------------------------------------------- read
     def read_file(self, repo: str, path: str) -> Dict[str, Any]:
@@ -191,11 +251,17 @@ class Workspace:
             except OSError:
                 return 0
 
-    def _enforce_cache_cap(self, exclude: Optional[Path] = None) -> None:
-        """Evict least-recently-used repos until total cache is under the cap. The
-        just-synced repo (``exclude``) is never evicted — otherwise a sync that
-        pushes the cache over the cap could immediately delete its own result."""
-        keep = exclude.resolve() if exclude else None
+    def _enforce_cache_cap(self, exclude: Any = None) -> None:
+        """Evict least-recently-used repos until total cache is under the cap. Repos
+        in ``exclude`` (a single dir or an iterable of them) are never evicted — so a
+        sync never deletes its own just-synced repo, and a refresh sweep never evicts a
+        repo it warmed THIS pass (protecting invariant #3 regardless of byte-accounting)."""
+        if exclude is None:
+            keep = set()
+        elif isinstance(exclude, (list, tuple, set)):
+            keep = {p.resolve() for p in exclude}
+        else:
+            keep = {exclude.resolve()}
         repos = []
         for owner_dir in self.root.iterdir() if self.root.exists() else []:
             if not owner_dir.is_dir():
@@ -209,8 +275,8 @@ class Workspace:
         for d in sorted(repos, key=self._used_at):  # oldest first
             if total <= self.max_cache_bytes:
                 break
-            if keep is not None and d.resolve() == keep:
-                continue                              # never evict the current repo
+            if d.resolve() in keep:
+                continue                              # never evict a protected repo
             sz = self._dir_bytes(d)
             logger.info("evicting %s/%s (%d bytes) — cache over cap", d.parent.name, d.name, sz)
             shutil.rmtree(d, ignore_errors=True)

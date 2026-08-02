@@ -65,3 +65,18 @@ class RepoInfo(BaseModel):
     repo: str
     head_sha: str
     last_used: int
+
+
+class RefreshRequest(BaseModel):
+    """Body for POST /refresh — an optional cap on how many repos to warm this
+    sweep (still clamped to the server's max_refresh_repos)."""
+    limit: Optional[int] = None
+
+
+class RefreshResponse(BaseModel):
+    discovered: int       # owner repos the GitHub API returned
+    refreshed: int        # successfully cloned/pulled this sweep
+    skipped: int          # discovered but not attempted (hit the count/byte bound)
+    errors: int           # per-repo failures (validated/oversized/unreachable) — sweep continued
+    repos: List[str]      # the repos actually warmed
+    bytes: int            # total bytes warmed this sweep

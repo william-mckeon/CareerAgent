@@ -84,3 +84,60 @@ class TestCloneOrPull:
         with pytest.raises(CodeProblem) as e:
             gitops.clone_or_pull("me/repo", tmp_path / "me" / "repo", None, timeout=1)
         assert e.value.status_code == 504
+
+
+class TestListOwnerRepos:
+    """Slice E — owner-repo discovery via the GitHub REST API (urllib mocked)."""
+
+    class _Resp:                       # a context-manager stand-in for urlopen()
+        def __init__(self, body): self._body = body
+        def read(self): return self._body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def test_no_token_raises_400(self):
+        with pytest.raises(CodeProblem) as e:
+            gitops.list_owner_repos(None)
+        assert e.value.status_code == 400
+
+    def test_returns_full_names_and_sends_bearer(self, monkeypatch):
+        import json
+        captured = {}
+        def fake_urlopen(req, timeout=None):
+            captured["auth"] = req.headers.get("Authorization")
+            captured["url"] = req.full_url
+            return self._Resp(json.dumps([{"full_name": "me/a"}, {"full_name": "me/b"}]).encode())
+        monkeypatch.setattr(gitops.urllib.request, "urlopen", fake_urlopen)
+        repos = gitops.list_owner_repos("TOK", per_page=100)
+        assert repos == ["me/a", "me/b"]
+        assert captured["auth"] == "Bearer TOK"          # PAT rides a header
+        assert "affiliation=owner" in captured["url"] and "sort=pushed" in captured["url"]
+
+    def test_paginates_until_short_page(self, monkeypatch):
+        import json, re
+        pages = {1: json.dumps([{"full_name": "me/a"}, {"full_name": "me/b"}]).encode(),
+                 2: json.dumps([{"full_name": "me/c"}]).encode()}     # short → stop
+        seen = []
+        def fake_urlopen(req, timeout=None):
+            pg = int(re.search(r"[?&]page=(\d+)", req.full_url).group(1))  # not per_page
+            seen.append(pg)
+            return self._Resp(pages[pg])
+        monkeypatch.setattr(gitops.urllib.request, "urlopen", fake_urlopen)
+        repos = gitops.list_owner_repos("TOK", per_page=2)
+        assert repos == ["me/a", "me/b", "me/c"] and seen == [1, 2]
+
+    def test_http_error_raises_502_without_leaking_token(self, monkeypatch):
+        import urllib.error
+        def boom(req, timeout=None):
+            raise urllib.error.HTTPError(url="x", code=401, msg="Unauthorized", hdrs=None, fp=None)
+        monkeypatch.setattr(gitops.urllib.request, "urlopen", boom)
+        with pytest.raises(CodeProblem) as e:
+            gitops.list_owner_repos("TOK")
+        assert e.value.status_code == 502 and "TOK" not in e.value.detail
+
+    def test_malformed_json_raises_502(self, monkeypatch):
+        monkeypatch.setattr(gitops.urllib.request, "urlopen",
+                            lambda req, timeout=None: self._Resp(b"not json"))
+        with pytest.raises(CodeProblem) as e:
+            gitops.list_owner_repos("TOK")
+        assert e.value.status_code == 502

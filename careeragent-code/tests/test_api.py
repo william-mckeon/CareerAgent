@@ -30,6 +30,12 @@ class FakeWorkspace:
     def list_repos(self):
         return [{"repo": "me/repo", "head_sha": "sha", "last_used": 123}]
 
+    def refresh(self, limit=None):
+        if limit == -1:                       # stand-in for a discovery failure
+            raise CodeProblem(502, "GitHub unreachable")
+        return {"discovered": 2, "refreshed": 2, "skipped": 0, "errors": 0,
+                "repos": ["me/a", "me/b"], "bytes": 100}
+
 
 @pytest.fixture
 def client(monkeypatch):
@@ -85,6 +91,19 @@ class TestRoutes:
     def test_list_ok(self, client):
         r = client.get("/list", headers=AUTH)
         assert r.status_code == 200 and r.json()[0]["repo"] == "me/repo"
+
+    def test_refresh_ok(self, client):
+        r = client.post("/refresh", headers=AUTH, json={})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["refreshed"] == 2 and body["repos"] == ["me/a", "me/b"] and body["discovered"] == 2
+
+    def test_refresh_requires_auth(self, client):
+        assert client.post("/refresh", json={}).status_code == 401
+
+    def test_refresh_discovery_failure_maps_502(self, client):
+        r = client.post("/refresh", headers=AUTH, json={"limit": -1})
+        assert r.status_code == 502
 
     def test_health_no_auth(self, client):
         r = client.get("/health")
