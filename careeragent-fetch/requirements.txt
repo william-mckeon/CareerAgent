@@ -1,0 +1,28 @@
+# ============================================================================
+# careeragent-fetch - Python dependencies
+# ============================================================================
+# A small egress + extraction box: a FastAPI app that fetches ONE user URL
+# (SSRF-guarded) and extracts text from ONE uploaded PDF/DOCX. No database, no
+# ML, NO model calls. All parsers are pure-Python and ship manylinux wheels, so
+# the image needs no apt layer.
+
+# FastAPI + ASGI server (bundles pydantic v2). Pins match the sibling services.
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+
+# Async HTTP client for the SSRF-safe fetch (manual redirects, streamed reads).
+httpx>=0.27.0
+
+# Multipart form parsing — required for the POST /extract file upload.
+python-multipart>=0.0.9
+
+# .env loading (mirrors the other services).
+python-dotenv>=1.0.0
+
+# HTML → clean main-content text, with a BeautifulSoup fallback + title.
+trafilatura>=1.8.0
+beautifulsoup4>=4.12.0
+
+# Uploaded-resume text extraction (both pure-Python).
+pdfplumber>=0.11.0        # PDF via pdfminer.six
+python-docx>=1.1.0        # DOCX via lxml (resolve_entities=False → no XXE)

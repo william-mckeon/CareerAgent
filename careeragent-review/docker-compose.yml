@@ -1,0 +1,39 @@
+# =============================================================================
+# careeragent-review — the repo-review harness (port 8007, internal).
+#
+#   careeragent-api ──POST /review-batch──▶ careeragent-review
+#        which fans out one bounded subagent per repo:
+#          ├─ careeragent-infra   /complete        (the model, per subagent)
+#          ├─ careeragent-github-mcp :8082/mcp      (read the repo, PAT-less)
+#          └─ careeragent-dossier /projects         (write the structured result)
+#
+# All boundaries resolve by service name over the external careeragent-network.
+#
+# Prereqs:
+#   docker network create careeragent-network   # once, shared by all services
+#   cp .env.example .env  &&  fill in the keys
+#   docker compose up -d --build
+# =============================================================================
+
+services:
+  careeragent-review:
+    build:
+      context: .
+      dockerfile: docker/review/Dockerfile
+    container_name: careeragent-review
+    env_file: .env
+    expose:
+      - "8007"
+    networks:
+      - careeragent-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8007/health',timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  careeragent-network:
+    external: true

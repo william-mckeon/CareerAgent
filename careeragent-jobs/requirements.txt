@@ -1,0 +1,16 @@
+# =============================================================================
+# requirements.txt
+#
+# careeragent-jobs is an async FastAPI service with an in-process worker task. It
+# persists jobs in its own Postgres and drives leaf services (careeragent-review,
+# careeragent-sessions) over HTTP. No ML libraries — the model work stays at
+# careeragent-api/infra. Versions match careeragent-sessions exactly.
+# =============================================================================
+
+fastapi>=0.110,<1.0           # web framework (bundles pydantic v2)
+uvicorn[standard]>=0.29,<1.0  # ASGI server
+pydantic>=2.0,<3.0            # request/response models (bundled with fastapi; pinned to v2)
+httpx>=0.27,<1.0              # async client for the outbound review/sessions calls
+SQLAlchemy[asyncio]>=2.0,<3.0 # async DB layer
+asyncpg>=0.29,<1.0            # async Postgres driver used by SQLAlchemy
+python-dotenv>=1.0,<2.0       # loads .env for local (non-Docker) development

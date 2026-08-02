@@ -1,0 +1,65 @@
+# =============================================================================
+# careeragent-jobs — the service plus its OWN Postgres.
+#
+# Two services: the jobs API+worker and its database (careeragent-jobs-db).
+# Both attach to the external `careeragent-network` so jobs can reach
+# careeragent-review and careeragent-sessions by container name. A single
+# `docker compose up -d --build` brings up both.
+#
+# Prereqs:
+#   docker network create careeragent-network        # once, shared by all services
+#   cp .env.example .env  &&  edit .env               # set the secrets + DB password
+#
+# Shared-DB note: this stack runs a dedicated Postgres by default. To share one
+# instance later, point JOBS_DB_HOST/NAME at it in .env and keep
+# JOBS_DB_SCHEMA=careeragent_jobs — no code change.
+# =============================================================================
+
+services:
+  careeragent-jobs:
+    build:
+      context: .
+      dockerfile: docker/jobs/Dockerfile
+    image: careeragent-jobs:0.1.0
+    container_name: careeragent-jobs
+    env_file:
+      - .env
+    environment:
+      # Point the app at its own DB container by name (overrides .env defaults).
+      JOBS_DB_HOST: jobs-db
+      JOBS_DB_PORT: "5432"
+    ports:
+      - "8011:8011"
+    depends_on:
+      jobs-db:
+        condition: service_healthy
+    networks:
+      - careeragent-network
+    restart: unless-stopped
+
+  jobs-db:
+    image: postgres:16
+    container_name: careeragent-jobs-db
+    environment:
+      POSTGRES_USER: ${JOBS_DB_USER:-careeragent_jobs}
+      POSTGRES_PASSWORD: ${JOBS_DB_PASSWORD}
+      POSTGRES_DB: ${JOBS_DB_NAME:-careeragent_jobs}
+    volumes:
+      - jobs-db-data:/var/lib/postgresql/data
+      # init.sql runs once on first boot: schema + jobs table + indexes.
+      - ./database/init.sql:/docker-entrypoint-initdb.d/careeragent-jobs-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${JOBS_DB_USER:-careeragent_jobs} -d ${JOBS_DB_NAME:-careeragent_jobs}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - careeragent-network
+    restart: unless-stopped
+
+volumes:
+  jobs-db-data:
+
+networks:
+  careeragent-network:
+    external: true

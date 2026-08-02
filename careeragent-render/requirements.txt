@@ -1,0 +1,22 @@
+# ============================================================================
+# careeragent-render - Python dependencies
+# ============================================================================
+# A pure, stateless résumé renderer: a FastAPI app that turns résumé markdown
+# into PDF/DOCX bytes. No database, NO model calls, NO network egress. Both
+# renderers are pure-Python and ship self-contained manylinux wheels (reportlab
+# bundles its own fonts; python-docx rides lxml's prebuilt wheels), so the image
+# needs NO apt layer and no build toolchain.
+
+# FastAPI + ASGI server (bundles pydantic v2). Pins match the sibling services.
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+
+# pydantic v2 (request/response models). Bundled by FastAPI; pinned for clarity.
+pydantic>=2.0
+
+# .env loading (mirrors the other services).
+python-dotenv>=1.0.0
+
+# Rendering — both pure-Python, self-contained wheels (no system libraries).
+reportlab>=4.2.0        # PDF via reportlab.platypus (bundles Base-14 fonts)
+python-docx>=1.1.0      # DOCX via lxml (resolve_entities default → no external DTDs)

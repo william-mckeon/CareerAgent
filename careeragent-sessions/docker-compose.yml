@@ -1,0 +1,65 @@
+# =============================================================================
+# careeragent-sessions — the service plus its OWN Postgres.
+#
+# Two services: the sessions API and its database (careeragent-sessions-db).
+# Both attach to the external `careeragent-network` so sessions can reach
+# careeragent-api by container name. A single `docker compose up -d --build`
+# brings up both.
+#
+# Prereqs:
+#   docker network create careeragent-network        # once, shared by all services
+#   cp .env.example .env  &&  edit .env               # set the secrets + DB password
+#
+# Shared-DB note: this stack runs a dedicated Postgres by default. To share one
+# instance later, point SESSIONS_DB_HOST/NAME at it in .env and keep
+# SESSIONS_DB_SCHEMA=careeragent_sessions — no code change.
+# =============================================================================
+
+services:
+  careeragent-sessions:
+    build:
+      context: .
+      dockerfile: docker/sessions/Dockerfile
+    image: careeragent-sessions:0.1.0
+    container_name: careeragent-sessions
+    env_file:
+      - .env
+    environment:
+      # Point the app at its own DB container by name (overrides .env defaults).
+      SESSIONS_DB_HOST: sessions-db
+      SESSIONS_DB_PORT: "5432"
+    ports:
+      - "8005:8005"
+    depends_on:
+      sessions-db:
+        condition: service_healthy
+    networks:
+      - careeragent-network
+    restart: unless-stopped
+
+  sessions-db:
+    image: postgres:16
+    container_name: careeragent-sessions-db
+    environment:
+      POSTGRES_USER: ${SESSIONS_DB_USER:-careeragent_sessions}
+      POSTGRES_PASSWORD: ${SESSIONS_DB_PASSWORD}
+      POSTGRES_DB: ${SESSIONS_DB_NAME:-careeragent_sessions}
+    volumes:
+      - sessions-db-data:/var/lib/postgresql/data
+      # init.sql runs once on first boot: schema + conversations/messages tables.
+      - ./database/init.sql:/docker-entrypoint-initdb.d/careeragent-sessions-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SESSIONS_DB_USER:-careeragent_sessions} -d ${SESSIONS_DB_NAME:-careeragent_sessions}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - careeragent-network
+    restart: unless-stopped
+
+volumes:
+  sessions-db-data:
+
+networks:
+  careeragent-network:
+    external: true

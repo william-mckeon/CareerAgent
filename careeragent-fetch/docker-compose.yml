@@ -1,0 +1,39 @@
+# =============================================================================
+# careeragent-fetch — the egress + extraction box (port 8008, internal).
+#
+#   careeragent-api ──POST /fetch────▶ careeragent-fetch ──▶ the public internet
+#                   ──POST /extract──▶                        (SSRF-guarded egress)
+#
+# The ONLY inbound client is careeragent-api. There is NO outbound to any other
+# CareerAgent service — the only egress is the user-controlled URL on /fetch,
+# and that is validated against the SSRF control list before every connection.
+# No host port is published (internal-only), matching careeragent-review.
+#
+# Prereqs:
+#   docker network create careeragent-network   # once, shared by all services
+#   cp .env.example .env  &&  fill in FETCH_API_KEY
+#   docker compose up -d --build
+# =============================================================================
+
+services:
+  careeragent-fetch:
+    build:
+      context: .
+      dockerfile: docker/fetch/Dockerfile
+    container_name: careeragent-fetch
+    env_file: .env
+    expose:
+      - "8008"
+    networks:
+      - careeragent-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8008/health',timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  careeragent-network:
+    external: true

@@ -1,0 +1,79 @@
+# =============================================================================
+# constraints.txt — the LOCKED, verified-working resolved dependency set.
+#
+# WHY THIS EXISTS: requirements.txt lists ranges. On 2026-07-16 a rebuild with
+# ZERO code changes floated litellm to 1.92.0, whose completion() lazily imports
+# a proxy handler needing orjson (undeclared outside litellm's [proxy] extra).
+# Every Bedrock call died with "No module named 'orjson'" while /health stayed
+# green, so the stack looked healthy through a total outage.
+#
+# The Dockerfile installs with:  pip install -r requirements.txt -c constraints.txt
+# so a rebuild resolves to exactly this set instead of drifting.
+#
+# REGENERATE only after verifying a REAL completion succeeds (not just /health):
+#   docker exec careeragent-infra pip freeze > constraints.txt
+# Frozen from the container that served a verified 200 completion on 2026-07-16.
+# =============================================================================
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+PyYAML==6.0.3
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.1
+aiosignal==1.4.0
+annotated-doc==0.0.4
+annotated-types==0.7.0
+anyio==4.14.2
+attrs==26.1.0
+boto3==1.43.49
+botocore==1.43.49
+certifi==2026.6.17
+charset-normalizer==3.4.9
+click==8.4.2
+distro==1.9.0
+fastapi==0.139.0
+fastuuid==0.14.0
+filelock==3.29.7
+frozenlist==1.8.0
+fsspec==2026.6.0
+h11==0.16.0
+hf-xet==1.5.1
+httpcore==1.0.9
+httptools==0.8.0
+httpx==0.28.1
+huggingface_hub==1.23.0
+idna==3.18
+importlib_metadata==8.9.0
+jiter==0.16.0
+jmespath==1.1.0
+jsonschema-specifications==2025.9.1
+jsonschema==4.26.0
+litellm==1.92.0
+multidict==6.7.1
+openai==2.45.0
+orjson==3.11.9
+packaging==26.2
+propcache==0.5.2
+pydantic==2.13.4
+pydantic_core==2.46.4
+python-dateutil==2.9.0.post0
+python-dotenv==1.2.2
+referencing==0.37.0
+regex==2026.7.10
+requests==2.34.2
+rpds-py==2026.6.3
+s3transfer==0.19.1
+six==1.17.0
+sniffio==1.3.1
+starlette==1.3.1
+tiktoken==0.13.0
+tokenizers==0.23.1
+tqdm==4.68.4
+typing-inspection==0.4.2
+typing_extensions==4.16.0
+urllib3==2.7.0
+uvicorn==0.51.0
+uvloop==0.22.1
+watchfiles==1.2.0
+websockets==16.1
+yarl==1.24.2
+zipp==4.1.0

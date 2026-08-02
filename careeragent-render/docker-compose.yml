@@ -1,0 +1,39 @@
+# =============================================================================
+# careeragent-render — the résumé document renderer (port 8009, internal).
+#
+#   careeragent-api ──POST /render──▶ careeragent-render
+#                                     (pure rendering; no model, no DB, no egress)
+#                    ◀── {content_b64, format, bytes, filename} ──
+#
+# The ONLY inbound client is careeragent-api. There is NO outbound to anything —
+# no sibling calls, no internet. No host port is published (internal-only),
+# matching careeragent-fetch / careeragent-ats / careeragent-review.
+#
+# Prereqs:
+#   docker network create careeragent-network   # once, shared by all services
+#   cp .env.example .env  &&  fill in RENDER_API_KEY
+#   docker compose up -d --build
+# =============================================================================
+
+services:
+  careeragent-render:
+    build:
+      context: .
+      dockerfile: docker/render/Dockerfile
+    container_name: careeragent-render
+    env_file: .env
+    expose:
+      - "8009"
+    networks:
+      - careeragent-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8009/health',timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  careeragent-network:
+    external: true

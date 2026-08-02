@@ -1,0 +1,19 @@
+# ============================================================================
+# careeragent-review - Python dependencies
+# ============================================================================
+# A thin orchestration service: a FastAPI app + httpx outbound clients + the
+# MCP SDK (to read GitHub via careeragent-github-mcp). No database, no ML.
+
+# FastAPI + ASGI server
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+
+# Async HTTP to careeragent-infra / careeragent-dossier
+httpx>=0.27.0
+
+# .env loading (mirrors the other services)
+python-dotenv>=1.0.0
+
+# Model Context Protocol SDK — streamable-HTTP client to careeragent-github-mcp.
+# 1.9+ for the streamable-HTTP transport.
+mcp>=1.9.0

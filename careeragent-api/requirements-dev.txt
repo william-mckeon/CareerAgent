@@ -1,0 +1,12 @@
+# ============================================================================
+# careeragent-api - Development / test dependencies
+# Maintainer: William McKeon
+# ============================================================================
+# Install with:  pip install -r requirements-dev.txt
+# These are NOT installed in the production image; see requirements.txt for the
+# runtime set. httpx is pulled in here because src/client/logger.py imports it
+# at module load and the signing-contract tests import that module.
+# ============================================================================
+
+pytest>=8.0
+httpx>=0.27

@@ -1,0 +1,24 @@
+{
+  "messages": [
+    { "role": "user", "content": "What job applications am I tracking?" }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "search_applications",
+        "description": "Find job applications by optional filters and/or a free-text query.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "q": { "type": "string", "description": "Free-text search over company/title/JD/resume/notes." },
+            "status": { "type": "string", "description": "e.g. applied, interviewing, offer, rejected." }
+          }
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "reasoning_effort": "low",
+  "model": "base"
+}

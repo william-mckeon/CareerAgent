@@ -1,0 +1,65 @@
+# =============================================================================
+# careeragent-github-mcp — the GitHub MCP boundary (credential-isolated).
+#
+# TWO containers, so careeragent-api stays PAT-LESS while the GitHub token lives
+# ONLY in this service:
+#
+#   careeragent-api (no PAT)
+#        │  http://careeragent-github-mcp:8082/mcp
+#        ▼
+#   careeragent-github-mcp         (Caddy) — HOLDS the PAT, injects
+#        │                          `Authorization: Bearer <PAT>` per request
+#        ▼
+#   careeragent-github-mcp-server  (official github-mcp-server, --read-only)
+#        ▼
+#   github.com  (your repos, read-only)
+#
+# github-mcp-server's HTTP mode requires a per-request Authorization header
+# (env token alone -> 401), so the proxy supplies it. Read-only three ways: the
+# server's --read-only flag, a read-only PAT, and the agent's own tool filter.
+#
+# Prereqs:
+#   docker network create careeragent-network     # once, shared by all services
+#   cp .env.example .env  &&  put your READ-ONLY PAT in it
+#   docker compose up -d
+# =============================================================================
+
+services:
+  # The official GitHub MCP server, read-only. Internal only — reached solely by
+  # the proxy on the shared network. Holds no host port.
+  careeragent-github-mcp-server:
+    image: ghcr.io/github/github-mcp-server:latest
+    container_name: careeragent-github-mcp-server
+    command:
+      - "http"
+      - "--port"
+      - "8082"
+      - "--listen-host"
+      - "0.0.0.0"
+      - "--read-only"
+      - "--toolsets"
+      - "context,repos,users"
+    networks:
+      - careeragent-network
+    restart: unless-stopped
+
+  # The auth-injecting proxy — the network-facing entry point. Holds the PAT and
+  # adds the Authorization header the server requires, so callers stay PAT-less.
+  careeragent-github-mcp:
+    image: caddy:2-alpine
+    container_name: careeragent-github-mcp
+    environment:
+      GITHUB_PAT: ${GITHUB_PAT}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    expose:
+      - "8082"
+    depends_on:
+      - careeragent-github-mcp-server
+    networks:
+      - careeragent-network
+    restart: unless-stopped
+
+networks:
+  careeragent-network:
+    external: true

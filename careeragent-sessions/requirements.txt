@@ -1,0 +1,15 @@
+# =============================================================================
+# requirements.txt
+#
+# careeragent-sessions is an async FastAPI service that persists conversation
+# transcripts in its own Postgres and relays /chat to careeragent-api. No ML
+# libraries — the model work stays at careeragent-api/infra. Pinned to
+# compatible ranges.
+# =============================================================================
+
+fastapi>=0.110,<1.0           # web framework (bundles pydantic v2)
+uvicorn[standard]>=0.29,<1.0  # ASGI server
+httpx>=0.27,<1.0              # async client for the /chat relay to careeragent-api
+SQLAlchemy[asyncio]>=2.0,<3.0 # async DB layer
+asyncpg>=0.29,<1.0            # async Postgres driver used by SQLAlchemy
+python-dotenv>=1.0,<2.0       # loads .env for local (non-Docker) development

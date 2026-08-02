@@ -1,0 +1,25 @@
+# =============================================================================
+# Caddyfile — the auth-injecting proxy for careeragent-github-mcp.
+#
+# github-mcp-server's HTTP mode requires a per-request `Authorization: Bearer`
+# token (confirmed: no header -> 401). To keep careeragent-api PAT-LESS, this
+# proxy holds the token (via the GITHUB_PAT env var) and injects the header on
+# every request before forwarding to the server. The GitHub credential stays in
+# this service; the agent never sends it.
+#
+#   careeragent-api (no PAT) -> caddy (:8082, injects Bearer) -> github-mcp-server (:8082)
+# =============================================================================
+
+{
+	admin off          # no admin API surface
+	auto_https off     # internal HTTP only, no TLS
+}
+
+:8082 {
+	reverse_proxy careeragent-github-mcp-server:8082 {
+		# Hold the PAT here and present it to the server per request.
+		header_up Authorization "Bearer {env.GITHUB_PAT}"
+		# Stream immediately — MCP streamable HTTP uses SSE responses.
+		flush_interval -1
+	}
+}

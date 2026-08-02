@@ -1,0 +1,22 @@
+# ============================================================================
+# careeragent-ats - Python dependencies
+# ============================================================================
+# A tiny, deterministic keyword-coverage scorer: a FastAPI app that scores one
+# resume against one job description. No database, NO model calls, NO network
+# egress, no file parsing. The only analysis dependency is rapidfuzz (fuzzy
+# near-matching). Every dependency ships manylinux wheels, so the image needs
+# no apt layer.
+
+# FastAPI + ASGI server (bundles pydantic v2). Pins match the sibling services.
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+
+# pydantic v2 (request/response models). Bundled by FastAPI; pinned for clarity.
+pydantic>=2.0
+
+# .env loading (mirrors the other services).
+python-dotenv>=1.0.0
+
+# Fuzzy near-matching for keyword coverage (Postgres/PostgreSQL, minor variants).
+# Pure C++ core shipped as prebuilt manylinux/win/macos wheels — no build tools.
+rapidfuzz>=3.0.0

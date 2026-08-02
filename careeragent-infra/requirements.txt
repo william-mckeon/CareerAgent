@@ -1,0 +1,29 @@
+# =============================================================================
+# requirements.txt  (project root)
+#
+# careeragent-infra is a pure-Python async proxy in front of Amazon Bedrock.
+# No GPU/ML libraries — no torch, transformers, accelerate, or CUDA tooling —
+# all inference runs on Bedrock. LiteLLM translates Bedrock's request/response
+# shapes to the OpenAI format both ways; boto3 provides the AWS SDK + credential
+# chain LiteLLM uses to reach Bedrock. Pinned to compatible ranges.
+# =============================================================================
+
+fastapi>=0.110,<1.0          # web framework for the proxy API (bundles pydantic)
+uvicorn[standard]>=0.29,<1.0 # ASGI server that runs the FastAPI app
+litellm==1.92.0              # Bedrock client; normalizes to OpenAI shape both ways.
+                             # PINNED EXACTLY, deliberately. This was `>=1.55,<2.0` and a
+                             # rebuild with NO code change floated it to 1.92.0, whose
+                             # completion() transitively imports litellm's proxy handler
+                             # (litellm/proxy/common_utils/http_parsing_utils.py) -> needs
+                             # orjson, which litellm does NOT declare outside its [proxy]
+                             # extra. Result: every /complete died with
+                             # "APIConnectionError: No module named 'orjson'" while /health
+                             # stayed green (the import is lazy). Total outage, zero code
+                             # changed. Do not re-float this without testing a real
+                             # completion; see constraints.txt for the full locked set.
+orjson>=3.10,<4.0            # REQUIRED by litellm's lazily-imported proxy http_parsing_utils
+                             # (see above). Not a direct dependency of our code — it exists
+                             # solely so litellm.completion() can import. Removing it breaks
+                             # Bedrock calls at RUNTIME only, not at import/health time.
+boto3>=1.34,<2.0             # AWS SDK + credential chain used by LiteLLM for Bedrock
+python-dotenv>=1.0,<2.0      # loads .env for local (non-Docker) development

@@ -1,0 +1,38 @@
+# =============================================================================
+# careeragent-ats — the deterministic keyword-coverage scorer (port 8010, internal).
+#
+#   careeragent-api ──POST /ats-score──▶ careeragent-ats
+#                                        (pure text analysis; no model, no DB, no egress)
+#
+# The ONLY inbound client is careeragent-api. There is NO outbound to anything —
+# no sibling calls, no internet. No host port is published (internal-only),
+# matching careeragent-fetch / careeragent-review.
+#
+# Prereqs:
+#   docker network create careeragent-network   # once, shared by all services
+#   cp .env.example .env  &&  fill in ATS_API_KEY
+#   docker compose up -d --build
+# =============================================================================
+
+services:
+  careeragent-ats:
+    build:
+      context: .
+      dockerfile: docker/ats/Dockerfile
+    container_name: careeragent-ats
+    env_file: .env
+    expose:
+      - "8010"
+    networks:
+      - careeragent-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8010/health',timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  careeragent-network:
+    external: true

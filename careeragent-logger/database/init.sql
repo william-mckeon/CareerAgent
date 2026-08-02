@@ -1,0 +1,660 @@
+-- =============================================================================
+-- careeragent-logger / database/init.sql
+--
+-- Bootstrap script for the careeragent_logger schema in the shared CareerAgent
+-- database (careeragent_shared).
+--
+-- Creates:
+--   1. careeragent_logger role      (idempotent, password sourced from
+--                                  the `logger.db_password` GUC at init time)
+--   2. careeragent_logger schema    (owned by the careeragent_logger role)
+--   3. Three parent partitioned tables, partitioned by RANGE (created_at):
+--        - careeragent_logger.ops_events             (short retention)
+--        - careeragent_logger.conversation_captures  (medium retention)
+--        - careeragent_logger.audit_events           (long retention)
+--   4. Indexes on each parent table (auto-propagated to every partition)
+--   5. Initial partitions for the current calendar month + the next month,
+--      so the service has somewhere to write from the moment it boots
+--   6. Schema-scoped grants for the careeragent_logger role
+--
+-- The schema is scoped within a shared database so another service can later
+-- share the same instance under its own schema and role without colliding with
+-- this one. Schema separation gives loose coupling - no cross-schema foreign
+-- keys, no shared tables, each service connects under its own role with grants
+-- limited to its own schema.
+--
+-- Partition naming convention (must match src/partitioning.py):
+--     <parent_table>_y<YYYY>m<MM>
+--     e.g. ops_events_y2026m05
+--
+-- Idempotency:
+--   This script can be re-run safely. Re-running on a populated schema is
+--   a no-op for tables/indexes/partitions; the role password is re-applied
+--   from `logger.db_password` on every run so `.env` is the single source
+--   of truth.
+--
+-- Password handoff (no separate ALTER ROLE step required):
+--   The `careeragent_logger` role's password is read from the custom GUC
+--   `logger.db_password`, which is set on the Postgres server via the
+--   PGOPTIONS environment variable when the container starts. The README
+--   step that brings up the shared Postgres passes:
+--       -e PGOPTIONS="-c logger.db_password=<value-from-.env>"
+--   so the value flows: .env -> docker run env -> PGOPTIONS -> server GUC
+--   -> current_setting('logger.db_password') -> CREATE/ALTER ROLE.
+--   If the GUC is missing or empty, this script aborts with a clear error
+--   instead of creating an unusable role.
+--
+-- How this is executed:
+--   * Local docker-compose / docker run: PostgreSQL's entrypoint runs all
+--     .sql files in /docker-entrypoint-initdb.d/ on first container start,
+--     as the POSTGRES_USER (superuser). PGOPTIONS is inherited by psql.
+--   * Render: bootstrap by connecting as the admin user with PGOPTIONS set:
+--       PGOPTIONS="-c logger.db_password=$LOGGER_DB_PASSWORD" \
+--           psql "$DATABASE_URL" -f database/init.sql
+--
+-- This script must be kept in lockstep with src/models.py. Column names,
+-- types, lengths, and indexes are mirrored on both sides.
+-- =============================================================================
+
+
+-- -----------------------------------------------------------------------------
+-- Extensions
+-- -----------------------------------------------------------------------------
+-- pgcrypto provides gen_random_uuid() on PostgreSQL < 13. On 13+ it's in core
+-- but enabling the extension is harmless and keeps the script portable.
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+
+-- -----------------------------------------------------------------------------
+-- Role: careeragent_logger
+-- -----------------------------------------------------------------------------
+-- Password is read from the `logger.db_password` GUC at init time. The
+-- GUC is supplied by the Postgres container's PGOPTIONS env var, sourced
+-- from LOGGER_DB_PASSWORD in .env (see README §"Prerequisites").
+--
+-- On first run:  the role is created with the GUC value as its password.
+-- On re-runs:    the role's password is re-set to the current GUC value,
+--                keeping `.env` and the database in sync.
+-- If GUC unset:  the script aborts with a clear error - no silent fallback
+--                to a placeholder, no unauthenticatable role left behind.
+
+DO $$
+DECLARE
+    role_password TEXT;
+    role_exists   BOOLEAN;
+BEGIN
+    -- current_setting(..., true) returns NULL if the GUC is missing
+    -- instead of raising an error. We handle the missing case ourselves
+    -- so we can give a useful message.
+    role_password := current_setting('logger.db_password', true);
+
+    IF role_password IS NULL OR role_password = '' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'invalid_parameter_value',
+            MESSAGE = 'Required GUC ''logger.db_password'' is not set.',
+            DETAIL  = 'careeragent-logger init.sql expects the careeragent_logger role''s '
+                      'password to be supplied via the PGOPTIONS env var on '
+                      'the Postgres container, e.g. '
+                      '-e PGOPTIONS="-c logger.db_password=$LOGGER_DB_PASSWORD".',
+            HINT    = 'See README §"Prerequisites: shared infrastructure" '
+                      'for the docker run command.';
+    END IF;
+
+    SELECT EXISTS(
+        SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'careeragent_logger'
+    ) INTO role_exists;
+
+    IF role_exists THEN
+        EXECUTE FORMAT(
+            'ALTER ROLE careeragent_logger WITH PASSWORD %L',
+            role_password
+        );
+        RAISE NOTICE 'Role careeragent_logger already existed; password re-applied from logger.db_password.';
+    ELSE
+        EXECUTE FORMAT(
+            'CREATE ROLE careeragent_logger '
+            'WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT '
+            'PASSWORD %L',
+            role_password
+        );
+        RAISE NOTICE 'Created role careeragent_logger with password from logger.db_password.';
+    END IF;
+END
+$$;
+
+
+-- -----------------------------------------------------------------------------
+-- Role: careeragent_logger_admin  (privileged owner; NOLOGIN)
+-- -----------------------------------------------------------------------------
+-- Owns the schema, the partitioned tables, and the partition-management
+-- functions. It is NOLOGIN: nothing ever connects as this role, so its
+-- privileges are reachable only through the SECURITY DEFINER functions below.
+--
+-- This is the privilege split that makes the append-only claim TRUE: the
+-- app's login role (careeragent_logger) is granted SELECT, INSERT and EXECUTE
+-- only. It does NOT own any object, so it cannot DROP, TRUNCATE, ALTER, or
+-- re-GRANT. Retention DROPs and calendar-boundary partition CREATEs happen
+-- exclusively through the two functions, which run with this owner's rights
+-- and validate their inputs. A compromised careeragent_logger token therefore
+-- cannot remove or rewrite audit data en masse.
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'careeragent_logger_admin'
+    ) THEN
+        CREATE ROLE careeragent_logger_admin
+            WITH NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT;
+        RAISE NOTICE 'Created role careeragent_logger_admin (NOLOGIN owner).';
+    ELSE
+        RAISE NOTICE 'Role careeragent_logger_admin already existed.';
+    END IF;
+END
+$$;
+
+
+-- -----------------------------------------------------------------------------
+-- Schema: careeragent_logger
+-- -----------------------------------------------------------------------------
+-- Owned by the admin role so the app login role cannot DROP SCHEMA ... CASCADE.
+
+CREATE SCHEMA IF NOT EXISTS careeragent_logger AUTHORIZATION careeragent_logger_admin;
+
+COMMENT ON SCHEMA careeragent_logger IS
+    'Capture layer for the CareerAgent system: operational events, conversation '
+    'captures, and audit events. Append-only, monthly-partitioned tables.';
+
+
+-- =============================================================================
+-- Parent table: careeragent_logger.ops_events
+-- =============================================================================
+-- Short-retention operational telemetry (~90 days).
+-- Examples: request_received, auth_failure, upstream_call, upstream_error,
+-- client_disconnect, stream_complete.
+--
+-- Partition key: created_at. Primary key includes created_at because
+-- PostgreSQL requires the partition key in every PK / UNIQUE constraint
+-- on a partitioned table.
+
+CREATE TABLE IF NOT EXISTS careeragent_logger.ops_events (
+    -- Envelope (common to every event table)
+    event_id          UUID         NOT NULL DEFAULT gen_random_uuid(),
+    request_id        UUID         NOT NULL,
+    source_service    VARCHAR(64)  NOT NULL,
+    created_at        TIMESTAMPTZ  NOT NULL,
+    client_timestamp  TIMESTAMPTZ  NOT NULL,
+    session_id        VARCHAR(64),
+    user_id           UUID,
+    hmac_signature    VARCHAR(64)  NOT NULL,
+    retention_class   VARCHAR(16)  NOT NULL DEFAULT 'short',
+
+    -- Per-type columns
+    action            VARCHAR(128) NOT NULL,
+    outcome           VARCHAR(32)  NOT NULL,
+    details           JSONB        NOT NULL DEFAULT '{}'::jsonb,
+
+    PRIMARY KEY (event_id, created_at)
+) PARTITION BY RANGE (created_at);
+
+COMMENT ON TABLE careeragent_logger.ops_events IS
+    'Short-retention operational telemetry. Monthly partitions; the daily '
+    'scheduler in src/scheduler.py drops partitions older than the '
+    'configured retention window (default 90 days).';
+
+-- Envelope-column single-column indexes (parent indexes propagate to children)
+CREATE INDEX IF NOT EXISTS ix_ops_events_request_id
+    ON careeragent_logger.ops_events (request_id);
+CREATE INDEX IF NOT EXISTS ix_ops_events_source_service
+    ON careeragent_logger.ops_events (source_service);
+CREATE INDEX IF NOT EXISTS ix_ops_events_created_at
+    ON careeragent_logger.ops_events (created_at);
+CREATE INDEX IF NOT EXISTS ix_ops_events_session_id
+    ON careeragent_logger.ops_events (session_id);
+CREATE INDEX IF NOT EXISTS ix_ops_events_user_id
+    ON careeragent_logger.ops_events (user_id);
+
+-- Composite indexes from src/models.py __table_args__
+CREATE INDEX IF NOT EXISTS ix_ops_events_session_created
+    ON careeragent_logger.ops_events (session_id, created_at);
+CREATE INDEX IF NOT EXISTS ix_ops_events_service_created
+    ON careeragent_logger.ops_events (source_service, created_at);
+CREATE INDEX IF NOT EXISTS ix_ops_events_action_created
+    ON careeragent_logger.ops_events (action, created_at);
+
+
+-- =============================================================================
+-- Parent table: careeragent_logger.conversation_captures
+-- =============================================================================
+-- Full /chat call captures (~180 days), stored for observability and audit.
+-- The schema is model-agnostic - the model identifier is recorded per row in
+-- the model_used column.
+
+CREATE TABLE IF NOT EXISTS careeragent_logger.conversation_captures (
+    -- Envelope
+    event_id          UUID         NOT NULL DEFAULT gen_random_uuid(),
+    request_id        UUID         NOT NULL,
+    source_service    VARCHAR(64)  NOT NULL,
+    created_at        TIMESTAMPTZ  NOT NULL,
+    client_timestamp  TIMESTAMPTZ  NOT NULL,
+    session_id        VARCHAR(64),
+    user_id           UUID,
+    hmac_signature    VARCHAR(64)  NOT NULL,
+    retention_class   VARCHAR(16)  NOT NULL DEFAULT 'medium',
+
+    -- Per-type columns
+    input_text        TEXT         NOT NULL,
+    output_text       TEXT         NOT NULL,
+    input_hash        VARCHAR(64)  NOT NULL,
+    output_hash       VARCHAR(64)  NOT NULL,
+    model_used        VARCHAR(255),
+    reasoning_effort  VARCHAR(16),
+    latency_ms        INTEGER,
+    input_tokens      INTEGER,
+    output_tokens     INTEGER,
+
+    PRIMARY KEY (event_id, created_at)
+) PARTITION BY RANGE (created_at);
+
+COMMENT ON TABLE careeragent_logger.conversation_captures IS
+    'Captured /chat conversations for observability and audit. Monthly '
+    'partitions; default retention 180 days. PII stripping, if required, '
+    'happens downstream, not here.';
+
+-- Envelope-column single-column indexes
+CREATE INDEX IF NOT EXISTS ix_capture_request_id
+    ON careeragent_logger.conversation_captures (request_id);
+CREATE INDEX IF NOT EXISTS ix_capture_source_service
+    ON careeragent_logger.conversation_captures (source_service);
+CREATE INDEX IF NOT EXISTS ix_capture_created_at
+    ON careeragent_logger.conversation_captures (created_at);
+CREATE INDEX IF NOT EXISTS ix_capture_session_id
+    ON careeragent_logger.conversation_captures (session_id);
+CREATE INDEX IF NOT EXISTS ix_capture_user_id
+    ON careeragent_logger.conversation_captures (user_id);
+
+-- Composite indexes from src/models.py __table_args__
+CREATE INDEX IF NOT EXISTS ix_capture_session_created
+    ON careeragent_logger.conversation_captures (session_id, created_at);
+CREATE INDEX IF NOT EXISTS ix_capture_user_created
+    ON careeragent_logger.conversation_captures (user_id, created_at);
+CREATE INDEX IF NOT EXISTS ix_capture_input_hash
+    ON careeragent_logger.conversation_captures (input_hash);
+
+
+-- =============================================================================
+-- Parent table: careeragent_logger.audit_events
+-- =============================================================================
+-- Security-relevant action records (~7 years, compliance-driven).
+-- Examples: key_rotation, secret_changed, admin_endpoint_hit,
+-- retention_job_run, auth_threshold_crossed.
+
+CREATE TABLE IF NOT EXISTS careeragent_logger.audit_events (
+    -- Envelope
+    event_id          UUID         NOT NULL DEFAULT gen_random_uuid(),
+    request_id        UUID         NOT NULL,
+    source_service    VARCHAR(64)  NOT NULL,
+    created_at        TIMESTAMPTZ  NOT NULL,
+    client_timestamp  TIMESTAMPTZ  NOT NULL,
+    session_id        VARCHAR(64),
+    user_id           UUID,
+    hmac_signature    VARCHAR(64)  NOT NULL,
+    retention_class   VARCHAR(16)  NOT NULL DEFAULT 'long',
+
+    -- Per-type columns
+    actor             VARCHAR(128) NOT NULL,
+    action            VARCHAR(128) NOT NULL,
+    target            VARCHAR(255),
+    outcome           VARCHAR(32)  NOT NULL,
+    ip_address        INET,
+    details           JSONB        NOT NULL DEFAULT '{}'::jsonb,
+
+    PRIMARY KEY (event_id, created_at)
+) PARTITION BY RANGE (created_at);
+
+COMMENT ON TABLE careeragent_logger.audit_events IS
+    'Compliance-grade audit log. Monthly partitions; default retention '
+    '~7 years (2555 days). Append-only - every row is intended to survive '
+    'for compliance review.';
+
+-- Envelope-column single-column indexes
+CREATE INDEX IF NOT EXISTS ix_audit_request_id
+    ON careeragent_logger.audit_events (request_id);
+CREATE INDEX IF NOT EXISTS ix_audit_source_service
+    ON careeragent_logger.audit_events (source_service);
+CREATE INDEX IF NOT EXISTS ix_audit_created_at
+    ON careeragent_logger.audit_events (created_at);
+CREATE INDEX IF NOT EXISTS ix_audit_session_id
+    ON careeragent_logger.audit_events (session_id);
+CREATE INDEX IF NOT EXISTS ix_audit_user_id
+    ON careeragent_logger.audit_events (user_id);
+
+-- Composite indexes from src/models.py __table_args__
+CREATE INDEX IF NOT EXISTS ix_audit_actor_created
+    ON careeragent_logger.audit_events (actor, created_at);
+CREATE INDEX IF NOT EXISTS ix_audit_action_created
+    ON careeragent_logger.audit_events (action, created_at);
+CREATE INDEX IF NOT EXISTS ix_audit_outcome_created
+    ON careeragent_logger.audit_events (outcome, created_at);
+
+
+-- =============================================================================
+-- Initial partitions: current calendar month and next calendar month
+-- =============================================================================
+-- The retention scheduler in src/scheduler.py creates next-month partitions
+-- daily, but we still need partitions to exist NOW so the first inbound
+-- event after deploy has somewhere to land.
+--
+-- Partition names follow the convention in src/partitioning.py:
+--     <parent_table>_y<YYYY>m<MM>
+
+DO $$
+DECLARE
+    cur_year      INT;
+    cur_month     INT;
+    nxt_year      INT;
+    nxt_month     INT;
+
+    cur_start     DATE;
+    cur_end       DATE;
+    nxt_start     DATE;
+    nxt_end       DATE;
+
+    cur_suffix    TEXT;
+    nxt_suffix    TEXT;
+
+    parent_tables TEXT[] := ARRAY['ops_events', 'conversation_captures', 'audit_events'];
+    parent_name   TEXT;
+BEGIN
+    cur_year  := EXTRACT(YEAR  FROM CURRENT_DATE)::INT;
+    cur_month := EXTRACT(MONTH FROM CURRENT_DATE)::INT;
+
+    IF cur_month = 12 THEN
+        nxt_year  := cur_year + 1;
+        nxt_month := 1;
+    ELSE
+        nxt_year  := cur_year;
+        nxt_month := cur_month + 1;
+    END IF;
+
+    -- Half-open ranges: [start, end)
+    cur_start := MAKE_DATE(cur_year, cur_month, 1);
+    cur_end   := MAKE_DATE(nxt_year, nxt_month, 1);
+    nxt_start := cur_end;
+
+    IF nxt_month = 12 THEN
+        nxt_end := MAKE_DATE(nxt_year + 1, 1, 1);
+    ELSE
+        nxt_end := MAKE_DATE(nxt_year, nxt_month + 1, 1);
+    END IF;
+
+    cur_suffix := FORMAT(
+        'y%sm%s',
+        LPAD(cur_year::TEXT,  4, '0'),
+        LPAD(cur_month::TEXT, 2, '0')
+    );
+    nxt_suffix := FORMAT(
+        'y%sm%s',
+        LPAD(nxt_year::TEXT,  4, '0'),
+        LPAD(nxt_month::TEXT, 2, '0')
+    );
+
+    RAISE NOTICE 'Creating initial partitions:';
+    RAISE NOTICE '  current month: % [% to %)', cur_suffix, cur_start, cur_end;
+    RAISE NOTICE '  next month:    % [% to %)', nxt_suffix, nxt_start, nxt_end;
+
+    FOREACH parent_name IN ARRAY parent_tables LOOP
+        -- Current month
+        EXECUTE FORMAT(
+            'CREATE TABLE IF NOT EXISTS %I.%I '
+            'PARTITION OF %I.%I '
+            'FOR VALUES FROM (%L) TO (%L)',
+            'careeragent_logger',
+            parent_name || '_' || cur_suffix,
+            'careeragent_logger',
+            parent_name,
+            cur_start,
+            cur_end
+        );
+        RAISE NOTICE '  ensured: careeragent_logger.%_%', parent_name, cur_suffix;
+
+        -- Next month
+        EXECUTE FORMAT(
+            'CREATE TABLE IF NOT EXISTS %I.%I '
+            'PARTITION OF %I.%I '
+            'FOR VALUES FROM (%L) TO (%L)',
+            'careeragent_logger',
+            parent_name || '_' || nxt_suffix,
+            'careeragent_logger',
+            parent_name,
+            nxt_start,
+            nxt_end
+        );
+        RAISE NOTICE '  ensured: careeragent_logger.%_%', parent_name, nxt_suffix;
+    END LOOP;
+END
+$$;
+
+
+-- =============================================================================
+-- Ownership: transfer every table in careeragent_logger to careeragent_logger_admin
+-- =============================================================================
+-- If init.sql was run by a superuser, the parent tables and the initial
+-- partitions are owned by that superuser. We transfer them to the NOLOGIN
+-- admin role so that:
+--   - the app login role (careeragent_logger) is NOT an owner and therefore
+--     cannot DROP / TRUNCATE / ALTER any table, and
+--   - the SECURITY DEFINER partition functions (owned by admin) can still
+--     CREATE next month's partition and DROP expired ones at runtime.
+--
+-- Partitions created at runtime are created BY the admin-owned function
+-- (SECURITY DEFINER runs as admin), so they inherit admin ownership and the
+-- app role never gains drop rights on them.
+
+DO $$
+DECLARE
+    rec RECORD;
+    owned_count INT := 0;
+BEGIN
+    FOR rec IN
+        SELECT c.relname
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'careeragent_logger'
+          AND c.relkind IN ('r', 'p')  -- regular table OR partitioned (parent) table
+    LOOP
+        EXECUTE FORMAT(
+            'ALTER TABLE %I.%I OWNER TO %I',
+            'careeragent_logger',
+            rec.relname,
+            'careeragent_logger_admin'
+        );
+        owned_count := owned_count + 1;
+    END LOOP;
+
+    RAISE NOTICE 'Transferred ownership of % object(s) to careeragent_logger_admin', owned_count;
+END
+$$;
+
+
+-- =============================================================================
+-- Partition-management functions (SECURITY DEFINER, owned by admin)
+-- =============================================================================
+-- These are the ONLY way the runtime can create or drop partitions. They run
+-- with the admin owner's rights but are callable by the app login role via an
+-- explicit EXECUTE grant. Each validates that the target is one of the three
+-- managed parent tables and follows the <parent>_yYYYYmMM naming convention,
+-- so the app role cannot use them to touch anything else. search_path is
+-- pinned to defeat search_path-hijack attacks against SECURITY DEFINER code.
+
+CREATE OR REPLACE FUNCTION careeragent_logger.create_month_partition(
+    p_parent TEXT,
+    p_start  DATE,
+    p_end    DATE
+) RETURNS TEXT
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    v_partition TEXT;
+BEGIN
+    IF p_parent NOT IN ('ops_events', 'conversation_captures', 'audit_events') THEN
+        RAISE EXCEPTION 'create_month_partition: unmanaged parent table %', p_parent;
+    END IF;
+    IF p_end <> (date_trunc('month', p_start::timestamp) + INTERVAL '1 month')::date
+       OR p_start <> date_trunc('month', p_start::timestamp)::date THEN
+        RAISE EXCEPTION 'create_month_partition: [%, %) is not a whole calendar month', p_start, p_end;
+    END IF;
+
+    v_partition := FORMAT('%s_y%sm%s',
+        p_parent,
+        to_char(p_start, 'YYYY'),
+        to_char(p_start, 'MM'));
+
+    EXECUTE FORMAT(
+        'CREATE TABLE IF NOT EXISTS careeragent_logger.%I '
+        'PARTITION OF careeragent_logger.%I FOR VALUES FROM (%L) TO (%L)',
+        v_partition, p_parent, p_start, p_end
+    );
+    RETURN v_partition;
+END
+$$;
+
+CREATE OR REPLACE FUNCTION careeragent_logger.drop_partition(
+    p_partition TEXT
+) RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    v_is_partition BOOLEAN;
+    v_year         INT;
+    v_month        INT;
+    v_end          DATE;
+    v_min_age_days INT;
+BEGIN
+    -- Name must match a managed parent's partition naming convention.
+    IF p_partition !~ '^(ops_events|conversation_captures|audit_events)_y[0-9]{4}m[0-9]{2}$' THEN
+        RAISE EXCEPTION 'drop_partition: % is not a managed partition name', p_partition;
+    END IF;
+
+    -- And it must actually BE a partition (a child via pg_inherits), never a
+    -- parent or an unrelated table that happens to match the pattern.
+    SELECT EXISTS (
+        SELECT 1
+        FROM pg_inherits i
+        JOIN pg_class c ON c.oid = i.inhrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'careeragent_logger' AND c.relname = p_partition
+    ) INTO v_is_partition;
+
+    IF NOT v_is_partition THEN
+        RAISE EXCEPTION 'drop_partition: % is not an attached partition', p_partition;
+    END IF;
+
+    -- Server-side retention floor: the function — not the caller — decides the
+    -- minimum age before a partition may be dropped. This is the backstop that
+    -- makes the append-only guarantee hold even if the app token is
+    -- compromised: a direct drop_partition('audit_events_y2026m06') for live or
+    -- within-window data is REFUSED here. The app scheduler's own cutoff still
+    -- decides WHICH expired partitions to drop; this only sets the hard minimum.
+    v_year  := substring(p_partition from '_y([0-9]{4})m[0-9]{2}$')::int;
+    v_month := substring(p_partition from 'm([0-9]{2})$')::int;
+    v_end   := (make_date(v_year, v_month, 1) + INTERVAL '1 month')::date;
+
+    v_min_age_days := CASE
+        WHEN p_partition LIKE 'audit_events_%'          THEN 2555  -- ~7 years
+        WHEN p_partition LIKE 'conversation_captures_%' THEN 180
+        ELSE 90                                                    -- ops_events
+    END;
+
+    IF v_end > (CURRENT_DATE - make_interval(days => v_min_age_days)) THEN
+        RAISE EXCEPTION
+            'drop_partition: % is within its minimum retention floor '
+            '(range ends %, floor % days) — refusing',
+            p_partition, v_end, v_min_age_days;
+    END IF;
+
+    EXECUTE FORMAT('DROP TABLE IF EXISTS careeragent_logger.%I', p_partition);
+    RETURN TRUE;
+END
+$$;
+
+ALTER FUNCTION careeragent_logger.create_month_partition(TEXT, DATE, DATE)
+    OWNER TO careeragent_logger_admin;
+ALTER FUNCTION careeragent_logger.drop_partition(TEXT)
+    OWNER TO careeragent_logger_admin;
+
+-- EXECUTE must be granted explicitly: default EXECUTE-to-PUBLIC is revoked so
+-- only the app login role can call these.
+REVOKE ALL ON FUNCTION careeragent_logger.create_month_partition(TEXT, DATE, DATE) FROM PUBLIC;
+REVOKE ALL ON FUNCTION careeragent_logger.drop_partition(TEXT) FROM PUBLIC;
+
+
+-- =============================================================================
+-- Grants for the careeragent_logger (app login) role
+-- =============================================================================
+-- Append-only AND ownership-free: SELECT and INSERT on the data, plus EXECUTE
+-- on the two partition functions. No UPDATE, no DELETE, no CREATE on the
+-- schema, and — because the tables are owned by careeragent_logger_admin, not
+-- this role — no DROP / TRUNCATE / ALTER. Retention and calendar-boundary
+-- partition management go exclusively through the SECURITY DEFINER functions.
+-- This is what makes "a compromised service token cannot silently rewrite or
+-- remove rows" actually hold, including against bulk removal via DROP.
+
+GRANT USAGE ON SCHEMA careeragent_logger TO careeragent_logger;
+
+GRANT SELECT, INSERT ON ALL TABLES    IN SCHEMA careeragent_logger TO careeragent_logger;
+GRANT USAGE          ON ALL SEQUENCES IN SCHEMA careeragent_logger TO careeragent_logger;
+
+GRANT EXECUTE ON FUNCTION careeragent_logger.create_month_partition(TEXT, DATE, DATE)
+    TO careeragent_logger;
+GRANT EXECUTE ON FUNCTION careeragent_logger.drop_partition(TEXT)
+    TO careeragent_logger;
+
+-- Future partitions are created by the admin-owned SECURITY DEFINER function
+-- (so they are owned by admin). Default privileges FOR ROLE careeragent_logger_admin
+-- ensure the app role automatically gets SELECT/INSERT on each new partition.
+ALTER DEFAULT PRIVILEGES FOR ROLE careeragent_logger_admin IN SCHEMA careeragent_logger
+    GRANT SELECT, INSERT ON TABLES TO careeragent_logger;
+ALTER DEFAULT PRIVILEGES FOR ROLE careeragent_logger_admin IN SCHEMA careeragent_logger
+    GRANT USAGE ON SEQUENCES TO careeragent_logger;
+
+
+-- =============================================================================
+-- Completion summary
+-- =============================================================================
+
+DO $$
+DECLARE
+    parent_count    INT;
+    partition_count INT;
+    index_count     INT;
+BEGIN
+    SELECT COUNT(*) INTO parent_count
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'careeragent_logger' AND c.relkind = 'p';
+
+    SELECT COUNT(*) INTO partition_count
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'careeragent_logger' AND c.relkind = 'r';
+
+    SELECT COUNT(*) INTO index_count
+    FROM pg_indexes
+    WHERE schemaname = 'careeragent_logger';
+
+    RAISE NOTICE '';
+    RAISE NOTICE '====================================================================';
+    RAISE NOTICE 'careeragent-logger schema initialization complete.';
+    RAISE NOTICE '  Schema:             careeragent_logger';
+    RAISE NOTICE '  Role:               careeragent_logger (password from logger.db_password GUC)';
+    RAISE NOTICE '  Parent tables:      %', parent_count;
+    RAISE NOTICE '  Initial partitions: %', partition_count;
+    RAISE NOTICE '  Indexes (all):      %', index_count;
+    RAISE NOTICE '====================================================================';
+END
+$$;

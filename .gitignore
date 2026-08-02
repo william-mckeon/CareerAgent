@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Local env / secrets (services keep their own .env; never commit real ones)
+.env
+
+# Stray local fixtures
+*.local.json

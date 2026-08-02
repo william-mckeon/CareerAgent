@@ -1,0 +1,130 @@
+# =============================================================================
+# docker-compose.yml  (project root)
+#
+# Design decisions
+# ---------------------------------------
+# 1. Single service — careeragent-infra only.
+#    Inference runs on Amazon Bedrock, so this repo needs no local inference
+#    server and no local model download step; this file runs the FastAPI proxy
+#    and nothing else.
+#
+# 2. No volumes — no model weights live here. There is nothing to download or
+#    mount locally.
+#
+# 3. No GPU dependency — the proxy has no CUDA requirement. There is no
+#    deploy.resources.reservations block; careeragent-infra is a pure Python
+#    web application.
+#
+# 4. Port topology:
+#      careeragent-api (:8001) → careeragent-infra (:8002) → Bedrock base model           [/chat, default]
+#                                                       → Bedrock nervous-system model [/chat, model="nervous_system"]
+#                                                       → Bedrock embedding model      [/embed]
+#    careeragent-infra is the only service. It validates auth on every request;
+#    on /chat it maps reasoning_effort to Claude's thinking depth and routes by
+#    the optional model field, on /embed it embeds the input — then calls Amazon
+#    Bedrock via LiteLLM. Model ids are set via BASE_MODEL (and optionally
+#    NERVOUS_SYSTEM_MODEL and EMBEDDING_MODEL) in .env. api is the primary caller
+#    today; other server-side services may call the proxy as the system grows.
+#
+# 5. All secrets come from the root .env file.
+#    API_KEY, the AWS credentials (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY or
+#    an IAM role), AWS_REGION_NAME, BASE_MODEL, NERVOUS_SYSTEM_MODEL,
+#    EMBEDDING_MODEL, REASONING_EFFORT, MAX_TOKENS, and REQUEST_TIMEOUT are
+#    never hardcoded — always loaded via env_file.
+#
+# 6. System prompt — the persona is owned by careeragent-api.
+#    careeragent-api sends it as the first system message on every /chat request.
+#    careeragent-infra never loads or stores a system prompt. (Embeddings carry
+#    no persona — /embed forwards raw input only.)
+#
+# 7. Auth — careeragent-infra validates X-API-Key on every /chat and /embed
+#    request (caller-facing). It authenticates to Amazon Bedrock with AWS
+#    credentials (static keys in .env or an attached IAM role) — a separate,
+#    provider-facing boundary that never touches the caller key.
+#
+# 8. REASONING_EFFORT — both chat models support configurable reasoning effort
+#    (the embedding model does not reason). Default is medium. The proxy maps
+#    the level to Claude's extended-thinking depth on Bedrock automatically.
+#    careeragent-api or any tooling can override per request (low / medium / high).
+#
+# Note: the `version` field has been intentionally removed. Modern Docker
+# Compose treats it as obsolete and emits a warning without it.
+#
+# Usage (from project root)
+# -------------------------
+#   docker-compose build --no-cache
+#   docker-compose up -d careeragent-infra
+#
+# Then send requests:
+#   curl http://localhost:8002/health
+#
+#   curl -X POST http://localhost:8002/chat \
+#     -H "Content-Type: application/json" \
+#     -H "X-API-Key: your_api_key_here" \
+#     -d '{"messages": [{"role": "system", "content": "You are CareerAgent..."}, {"role": "user", "content": "hello"}], "reasoning_effort": "medium"}' \
+#     --no-buffer
+#
+#   curl -X POST http://localhost:8002/embed \
+#     -H "Content-Type: application/json" \
+#     -H "X-API-Key: your_api_key_here" \
+#     -d '{"input": ["first chunk", "second chunk"]}'
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # careeragent-infra
+  #
+  # Runs the FastAPI proxy on port 8002. The only service in this repo.
+  #
+  # Responsibilities:
+  #   - Validates X-API-Key header on every /chat and /embed request (401 if invalid)
+  #   - /chat : validates the OpenAI messages body, maps reasoning_effort to
+  #             Claude's thinking depth, routes to BASE_MODEL (default) or
+  #             NERVOUS_SYSTEM_MODEL based on the optional model field, and
+  #             streams the OpenAI-shaped SSE response back to the caller
+  #   - /embed: validates the input, embeds it via EMBEDDING_MODEL, and returns
+  #             the OpenAI-shaped JSON embeddings response (no streaming)
+  #   - Calls Amazon Bedrock via LiteLLM, authenticated with AWS credentials
+  #     (static keys in .env or an attached IAM role)
+  #   - /health reports configuration + AWS-credential status for the three
+  #     routes (base, nervous-system, embedding)
+  #
+  # Port 8002 is the only externally exposed port here.
+  # Port 8001 is reserved for careeragent-api; port 8000 for careeragent-frontend.
+  # Topology: careeragent-api (:8001) → careeragent-infra (:8002) → Amazon Bedrock
+  #
+  # BASE_MODEL (and optionally NERVOUS_SYSTEM_MODEL / EMBEDDING_MODEL) in .env
+  # must be set to LiteLLM Bedrock model ids for models you have enabled in your
+  # account + region, e.g.:
+  #   bedrock/us.anthropic.claude-opus-4-8
+  #   bedrock/amazon.titan-embed-text-v2:0
+  # ---------------------------------------------------------------------------
+  careeragent-infra:
+    build:
+      context: .
+      dockerfile: docker/model/Dockerfile
+    image: careeragent-infra:latest
+    container_name: careeragent-infra
+    env_file:
+      - .env
+    command: ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8002"]
+    # Bind only to localhost on the host. Inter-service traffic (careeragent-api →
+    # careeragent-infra) flows over the compose network by service name and does
+    # NOT use this published port, so binding to 127.0.0.1 keeps the proxy off
+    # any external interface while leaving in-network calls unaffected.
+    ports:
+      - "127.0.0.1:8002:8002"
+    restart: unless-stopped
+    # Join the shared external network so careeragent-api can reach this service
+    # by name (careeragent-infra:8002). The 127.0.0.1 host binding above still
+    # keeps the published port off external interfaces; inter-service traffic
+    # flows over this network, not the host port.
+    networks:
+      - careeragent-network
+
+# Shared external network for service-name resolution across the stacks.
+# Create it once:  docker network create careeragent-network
+networks:
+  careeragent-network:
+    external: true

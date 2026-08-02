@@ -1,0 +1,269 @@
+# ============================================================================
+# careeragent-api - Docker Compose
+# Maintainer: William McKeon
+# The identity gateway for CareerAgent
+# ============================================================================
+#
+# ROLE:
+#   Single-service compose stack for careeragent-api. Builds the image from
+#   docker/api/Dockerfile, wires environment variables from .env, and
+#   exposes the gateway on host port 8001 per the port convention:
+#     8000 = careeragent-frontend (user-facing)
+#     8001 = careeragent-api      (this service)
+#     8002 = careeragent-infra    (model layer, separate stack)
+#     8003 = careeragent-logger   (capture layer, separate stack)
+#     8004 = careeragent-memory   (RAG layer, separate stack — optional/opt-in)
+#
+# DEPLOYMENT TOPOLOGIES:
+#   careeragent-frontend, careeragent-api, careeragent-infra, careeragent-logger, and
+#   careeragent-memory each live in their own repos with their own compose
+#   files. careeragent-api has up to three outbound boundaries: careeragent-infra
+#   (hot path, /chat relay), careeragent-logger (fire-and-forget event
+#   emission), and — when configured — careeragent-memory (opt-in RAG
+#   retrieve/ingest). Three topologies are supported, selected by what
+#   CAREERAGENT_INFRA_URL, LOGGER_URL, and (optionally) MEMORY_URL are set to in
+#   .env:
+#
+#     1. Everything on the host (no Docker for any service):
+#          CAREERAGENT_INFRA_URL=http://localhost:8002
+#          LOGGER_URL=http://localhost:8003
+#          MEMORY_URL=http://localhost:8004            # optional
+#
+#     2. careeragent-api in Docker, upstreams on host:
+#          CAREERAGENT_INFRA_URL=http://host.docker.internal:8002
+#          LOGGER_URL=http://host.docker.internal:8003
+#          MEMORY_URL=http://host.docker.internal:8004 # optional
+#        (The extra_hosts directive below makes this work on Linux as well
+#        as Docker Desktop. This is the default — the dev workflow has the
+#        upstreams running on the host, reached via the host's port
+#        mapping.)
+#
+#     3. careeragent-api, careeragent-infra, careeragent-logger (and optionally
+#        careeragent-memory) all in Docker on a shared external network:
+#          CAREERAGENT_INFRA_URL=http://careeragent-infra:8002
+#          LOGGER_URL=http://careeragent-logger:8003
+#          MEMORY_URL=http://careeragent-memory:8004      # optional
+#        (Requires the operator to create the shared network and set the
+#        networks: directive accordingly. See "SHARED NETWORK" below. The
+#        network name is `careeragent-network`, matching careeragent-logger's
+#        compose file out of the box.)
+#
+#   The default in .env.example is topology 2 (host.docker.internal) because
+#   that is the most common dev setup — careeragent-infra running on the host
+#   as a thin FastAPI proxy in front of a BYOC provider, careeragent-logger
+#   running in its own Docker stack on the host, and careeragent-api in a
+#   container. careeragent-memory, when enabled, follows the same pattern.
+#
+# SHARED NETWORK (topology 3):
+#   To put careeragent-api, careeragent-infra, careeragent-logger (and, when
+#   enabled, careeragent-memory) on the same Docker network, the operator must
+#   create the network once:
+#     docker network create careeragent-network
+#   Then uncomment the `networks:` block at the bottom of this file and the
+#   `networks:` line in the service definition. All participating compose
+#   stacks (careeragent-api, careeragent-infra, careeragent-logger, and
+#   careeragent-memory if used) must reference the same external network for
+#   service-name resolution to work. careeragent-logger's compose file already
+#   declares `careeragent-network` as external, so no change is needed there.
+#
+# WHY SINGLE SERVICE?
+#   careeragent-api is one container. It does not own a database, a worker, or
+#   anything else. Other services in the system live in their own repos with
+#   their own compose files and connect to careeragent-api (or are connected to
+#   by it) over HTTP — they are not added here. careeragent-logger remains in
+#   its own compose stack and careeragent-api reaches it via LOGGER_URL.
+#   careeragent-memory, when enabled, likewise lives in its own stack and is
+#   reached via MEMORY_URL — it owns its OWN database (pgvector); careeragent-api
+#   stores nothing locally.
+#
+# REBUILD WHEN:
+#   - src/backend/api.py changes        → docker-compose up -d --build
+#   - src/client/*.py changes           → docker-compose up -d --build
+#                                         (the single COPY src/client/
+#                                         directive in the Dockerfile covers
+#                                         client/infra.py, client/logger.py,
+#                                         and client/memory.py)
+#   - src/prompt/bio.txt changes        → docker-compose up -d --build
+#   - requirements.txt changes          → docker-compose up -d --build
+#   - docker/api/Dockerfile changes     → docker-compose up -d --build
+#   - .env changes                      → docker-compose up -d (no rebuild needed)
+# ============================================================================
+
+# Compose file format version pinned to 3.8 — last revision of the v3 spec
+# that supports modern features like extra_hosts: host-gateway and the
+# healthcheck variants. v3.8 is what careeragent-infra and careeragent-frontend
+# use per their respective repos.
+# version: "3.8"
+
+# ----------------------------------------------------------------------------
+# SERVICES
+# ----------------------------------------------------------------------------
+services:
+
+  careeragent-api:
+    # ------------------------------------------------------------------------
+    # IMAGE / BUILD
+    # ------------------------------------------------------------------------
+    # Build context is the repo root so the Dockerfile's COPY directives
+    # (which reference src/prompt/, src/client/, src/backend/,
+    # requirements.txt) resolve against the repo layout. The src/client/ COPY
+    # directive picks up all client modules (infra.py, logger.py, memory.py)
+    # because it copies the entire directory — no per-module Dockerfile change.
+    build:
+      context: .
+      dockerfile: docker/api/Dockerfile
+    image: careeragent-api:1.0.0
+    container_name: careeragent-api
+
+    # ------------------------------------------------------------------------
+    # ENVIRONMENT
+    # ------------------------------------------------------------------------
+    # All secrets and tunables come from .env at the repo root. The file is
+    # gitignored; .env.example documents the schema.
+    #
+    # Required variables (api.py refuses to start without these):
+    #   CAREERAGENT_API_KEY    — inbound auth secret (frontend → careeragent-api)
+    #   INFRA_API_KEY        — outbound auth secret (api → careeragent-infra)
+    #   CAREERAGENT_INFRA_URL  — base URL of careeragent-infra
+    #   LOGGER_URL           — base URL of careeragent-logger
+    #   LOGGER_API_KEY       — outbound auth secret to careeragent-logger
+    #   LOGGER_HMAC_SECRET   — payload-signing secret for events
+    #
+    # Optional variables (api.py applies defaults):
+    #   CAREERAGENT_FRONTEND_URL          — extra CORS origin
+    #   CAREERAGENT_LOG_LEVEL             — DEBUG | INFO | WARNING | ERROR | CRITICAL
+    #   CAREERAGENT_UPSTREAM_CONNECT_TIMEOUT  — seconds, default 10.0
+    #   CAREERAGENT_UPSTREAM_READ_TIMEOUT     — seconds or "none", default unbounded
+    #                                     (unbounded accommodates provider
+    #                                     cold-start + high-effort generation)
+    #   CAREERAGENT_HEALTH_TIMEOUT        — seconds, default 5.0
+    #   CAREERAGENT_BIO_PATH              — override bio.txt path inside container
+    #   CAREERAGENT_LOGGER_QUEUE_MAX_SIZE — max pending events in LoggerClient
+    #                                     queue before drop-oldest kicks in,
+    #                                     default 1000.
+    #
+    # Optional careeragent-memory variables (opt-in; memory is enabled only when
+    # both MEMORY_URL and MEMORY_API_KEY are set — otherwise full history is
+    # forwarded as before):
+    #   MEMORY_URL                      — base URL of careeragent-memory
+    #   MEMORY_API_KEY                  — outbound auth secret to careeragent-memory
+    #                                     (transport-key only; no HMAC today)
+    #   MEMORY_SESSION_ID               — scopes retrieve/ingest + sets the
+    #                                     session_id on emitted logger events
+    #   MEMORY_RECENT_N                 — recent turns kept verbatim, default 10
+    #   MEMORY_TOP_K                    — retrieve cap, default = memory's own (5)
+    #   MEMORY_RETRIEVE_TIMEOUT         — seconds, hot-path bound, default 5.0
+    #
+    # The compose file does not declare these inline — they live in .env and
+    # are passed via env_file: as with the other secrets.
+    env_file:
+      - .env
+
+    # ------------------------------------------------------------------------
+    # PORTS
+    # ------------------------------------------------------------------------
+    # Host port 8001 → container port 8001. The container's uvicorn binds to
+    # 0.0.0.0:8001 per the Dockerfile CMD, so the mapping is 1:1. Operators
+    # behind a port collision can change the LEFT side only:
+    #   ports:
+    #     - "8011:8001"    # host 8011 → container 8001
+    # careeragent-frontend's .env then needs CAREERAGENT_API_URL to match.
+    ports:
+      - "8001:8001"
+
+    # ------------------------------------------------------------------------
+    # EXTRA HOSTS
+    # ------------------------------------------------------------------------
+    # Makes host.docker.internal resolve to the host machine on Linux. Docker
+    # Desktop (Mac/Windows) provides this automatically; Linux does not, so we
+    # declare it explicitly for cross-platform parity. Required for topology 2
+    # (careeragent-api in Docker, upstreams on host) — the default topology.
+    # careeragent-api uses this single entry to reach ALL of its upstream
+    # services on the host via:
+    #   CAREERAGENT_INFRA_URL=http://host.docker.internal:8002
+    #   LOGGER_URL=http://host.docker.internal:8003
+    #   MEMORY_URL=http://host.docker.internal:8004   (when memory is enabled)
+    # One host-gateway entry covers every upstream port; no per-service entry
+    # is needed.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # ------------------------------------------------------------------------
+    # RESTART POLICY
+    # ------------------------------------------------------------------------
+    # `unless-stopped` auto-restarts on crash, OOM, or daemon restart, but
+    # respects explicit `docker-compose stop`. This is the default used by
+    # careeragent-infra and careeragent-frontend per their READMEs.
+    restart: unless-stopped
+
+    # ------------------------------------------------------------------------
+    # HEALTHCHECK
+    # ------------------------------------------------------------------------
+    # Inherited from the Dockerfile's HEALTHCHECK directive. We don't redefine
+    # it here because doing so would override the Dockerfile's version and
+    # create two sources of truth. The Dockerfile is the authoritative
+    # healthcheck.
+
+    # ------------------------------------------------------------------------
+    # NETWORKS (topology 3 — uncomment to enable)
+    # ------------------------------------------------------------------------
+    # When careeragent-api, careeragent-infra, careeragent-logger (and, when
+    # enabled, careeragent-memory) all run in Docker and need to reach each
+    # other by service name
+    # (CAREERAGENT_INFRA_URL=http://careeragent-infra:8002,
+    #  LOGGER_URL=http://careeragent-logger:8003,
+    #  MEMORY_URL=http://careeragent-memory:8004), uncomment both this block and
+    # the top-level `networks:` block at the bottom of this file. The operator
+    # must also create the network once on the host:
+    #   docker network create careeragent-network
+    # All sibling compose stacks (careeragent-infra, careeragent-logger, and
+    # careeragent-memory if used) must reference the same external network.
+    # careeragent-logger's compose file already declares `careeragent-network` as
+    # external, so no change is needed there.
+    #
+    networks:
+      - careeragent-network
+
+    # ------------------------------------------------------------------------
+    # LOGGING
+    # ------------------------------------------------------------------------
+    # Cap the json-file driver so a chatty service can't fill the host disk.
+    # careeragent-api logs are typically low-volume (one INFO line per request)
+    # so 10 MB × 3 files = 30 MB max retained per container. Operators with a
+    # central log shipper (Loki, Datadog, CloudWatch) can override this in a
+    # compose override file.
+    #
+    # Note: careeragent-api's stdout logs are separate from the events emitted
+    # to careeragent-logger. The Docker logs capped here contain operator-facing
+    # INFO/WARNING/ERROR lines (one per /chat, plus lifespan startup/shutdown
+    # messages). Structured event capture (request_received / upstream_call /
+    # upstream_error / stream_complete / conversation_capture, plus
+    # memory_retrieve_degraded and memory_ingest_error when memory is enabled)
+    # lands in careeragent-logger's Postgres tables, not in this Docker log
+    # stream.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# ----------------------------------------------------------------------------
+# NETWORKS (topology 3 — uncomment to enable)
+# ----------------------------------------------------------------------------
+# This declares `careeragent-network` as an external network created outside
+# this compose stack. careeragent-logger's compose file declares the same
+# external network. careeragent-infra's compose file (and careeragent-memory's, if
+# you run memory in Docker) should declare the same external network if you
+# want all the services on the unified Docker network. The operator runs
+# `docker network create careeragent-network` once before bringing up any of
+# the stacks.
+#
+# See the SHARED NETWORK section in the header for the full bring-up steps.
+#
+networks:
+  careeragent-network:
+    external: true
+
+# ============================================================================
+# END OF FILE
+# ============================================================================

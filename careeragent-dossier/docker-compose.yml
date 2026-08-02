@@ -1,0 +1,65 @@
+# =============================================================================
+# careeragent-dossier — the service plus its OWN Postgres.
+#
+# Two services: the dossier API and its database (careeragent-dossier-db). Both
+# attach to the external `careeragent-network` so careeragent-api can reach
+# dossier by container name. A single `docker compose up -d --build` brings up
+# both.
+#
+# Prereqs:
+#   docker network create careeragent-network        # once, shared by all services
+#   cp .env.example .env  &&  edit .env               # set the API key + DB password
+#
+# Shared-DB note: this stack runs a dedicated Postgres by default. To share one
+# instance later, point DOSSIER_DB_HOST/NAME at it in .env and keep
+# DOSSIER_DB_SCHEMA=careeragent_dossier — no code change.
+# =============================================================================
+
+services:
+  careeragent-dossier:
+    build:
+      context: .
+      dockerfile: docker/dossier/Dockerfile
+    image: careeragent-dossier:0.1.0
+    container_name: careeragent-dossier
+    env_file:
+      - .env
+    environment:
+      # Point the app at its own DB container by name (overrides .env defaults).
+      DOSSIER_DB_HOST: dossier-db
+      DOSSIER_DB_PORT: "5432"
+    ports:
+      - "8006:8006"
+    depends_on:
+      dossier-db:
+        condition: service_healthy
+    networks:
+      - careeragent-network
+    restart: unless-stopped
+
+  dossier-db:
+    image: postgres:16
+    container_name: careeragent-dossier-db
+    environment:
+      POSTGRES_USER: ${DOSSIER_DB_USER:-careeragent_dossier}
+      POSTGRES_PASSWORD: ${DOSSIER_DB_PASSWORD}
+      POSTGRES_DB: ${DOSSIER_DB_NAME:-careeragent_dossier}
+    volumes:
+      - dossier-db-data:/var/lib/postgresql/data
+      # init.sql runs once on first boot: schema + tables + FTS/trigram indexes.
+      - ./database/init.sql:/docker-entrypoint-initdb.d/careeragent-dossier-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DOSSIER_DB_USER:-careeragent_dossier} -d ${DOSSIER_DB_NAME:-careeragent_dossier}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - careeragent-network
+    restart: unless-stopped
+
+volumes:
+  dossier-db-data:
+
+networks:
+  careeragent-network:
+    external: true

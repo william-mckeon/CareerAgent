@@ -1,0 +1,7 @@
+# Test-only dependencies for careeragent-memory. NOT installed in the production
+# image — keep these out of requirements.txt.
+#
+# The suite uses asyncio.run() for async tests, so pytest-asyncio is optional;
+# it is listed here only in case future tests adopt @pytest.mark.asyncio.
+pytest>=8.0,<10.0
+pytest-asyncio>=0.23,<2.0

@@ -1,0 +1,13 @@
+# =============================================================================
+# requirements.txt
+#
+# careeragent-dossier is an async FastAPI service that stores the master profile
+# and the application tracker in its own Postgres (structured + full-text +
+# trigram lookup — NO vectors, no ML libraries). Pinned to compatible ranges.
+# =============================================================================
+
+fastapi>=0.110,<1.0           # web framework (bundles pydantic v2)
+uvicorn[standard]>=0.29,<1.0  # ASGI server
+SQLAlchemy[asyncio]>=2.0,<3.0 # async DB layer
+asyncpg>=0.29,<1.0            # async Postgres driver used by SQLAlchemy
+python-dotenv>=1.0,<2.0       # loads .env for local (non-Docker) development

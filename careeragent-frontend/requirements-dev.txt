@@ -1,0 +1,4 @@
+# Development-only dependencies. NOT installed in the production image.
+# Production runtime deps live in requirements.txt and must not be edited
+# to add test tooling.
+pytest>=8.0

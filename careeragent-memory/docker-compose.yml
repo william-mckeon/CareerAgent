@@ -1,0 +1,56 @@
+# careeragent-memory — the service plus its OWN Postgres (pgvector).
+#
+# memory owns this database outright; it is not the logger's shared instance.
+# Both containers attach to the external `careeragent-network` (created and owned by
+# careeragent-logger per the careeragent-os runbook) so memory can reach careeragent-infra
+# by container name for /embed.
+
+services:
+  careeragent-memory:
+    build:
+      context: .
+      dockerfile: docker/memory/Dockerfile
+    image: careeragent-memory:0.1.0
+    container_name: careeragent-memory
+    env_file:
+      - .env
+    environment:
+      # Point the app at its own DB container by name.
+      MEMORY_DB_HOST: memory-db
+      MEMORY_DB_PORT: "5432"
+    ports:
+      - "8004:8004"
+    depends_on:
+      memory-db:
+        condition: service_healthy
+    networks:
+      - careeragent-network
+    restart: unless-stopped
+
+  memory-db:
+    image: pgvector/pgvector:pg16
+    container_name: careeragent-memory-db
+    environment:
+      # Single source of truth: the same MEMORY_DB_* values the app connects with.
+      POSTGRES_USER: ${MEMORY_DB_USER:-careeragent_memory}
+      POSTGRES_PASSWORD: ${MEMORY_DB_PASSWORD}
+      POSTGRES_DB: ${MEMORY_DB_NAME:-careeragent_memory}
+    volumes:
+      - memory-db-data:/var/lib/postgresql/data
+      # init.sql runs once on first boot: CREATE EXTENSION vector + the turns table.
+      - ./database/init.sql:/docker-entrypoint-initdb.d/careeragent-memory-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${MEMORY_DB_USER:-careeragent_memory} -d ${MEMORY_DB_NAME:-careeragent_memory}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - careeragent-network
+    restart: unless-stopped
+
+volumes:
+  memory-db-data:
+
+networks:
+  careeragent-network:
+    external: true

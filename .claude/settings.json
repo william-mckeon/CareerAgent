@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/willi/OneDrive/Desktop/open source/CareerAgent-os/CareerAgent-infra/**)"
+    ]
+  }
+}

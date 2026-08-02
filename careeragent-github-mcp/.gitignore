@@ -1,0 +1,9 @@
+# Secrets — never commit (this file holds the GitHub PAT)
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
