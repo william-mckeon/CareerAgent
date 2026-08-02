@@ -201,6 +201,59 @@ class TestTick:
         assert store.advanced == []
         assert sessions.created == 0     # didn't even resolve a conversation
 
+    async def test_silent_kind_enqueued_without_a_conversation(self):
+        # Slice E — repo_presync never injects, so it is enqueued with conversation_id
+        # None and does NOT resolve/mint the Reminders conversation.
+        due = [{"id": "s3", "name": "repo_presync", "kind": "repo_presync",
+                "spec": {}, "interval_seconds": 86400}]
+        store = FakeStore(due=due, settings={})
+        sessions = FakeSessions()
+        await _tick(store, sessions)
+        assert store.enqueued == [("repo_presync", {}, None)]
+        assert store.advanced == [("s3", 86400)]
+        assert sessions.created == 0 and sessions.list_calls == 0   # no Reminders thread touched
+
+    async def test_silent_warm_runs_even_when_sessions_is_down(self):
+        # A sessions outage can't defer the cache-warm — it needs no conversation.
+        due = [{"id": "s3", "name": "repo_presync", "kind": "repo_presync",
+                "spec": {}, "interval_seconds": 86400}]
+        store = FakeStore(due=due, settings={})
+        sessions = FakeSessions(create=(0, {"error": "sessions down"}))
+        await _tick(store, sessions)
+        assert store.enqueued == [("repo_presync", {}, None)]   # still enqueued
+        assert store.advanced == [("s3", 86400)]
+
+    async def test_mixed_silent_and_reminder(self):
+        due = [
+            {"id": "s1", "name": "follow_up_scan", "kind": "follow_up_scan",
+             "spec": {}, "interval_seconds": 86400},
+            {"id": "s3", "name": "repo_presync", "kind": "repo_presync",
+             "spec": {}, "interval_seconds": 3600},
+        ]
+        store = FakeStore(due=due, settings={REMINDERS_CONVERSATION_KEY: "cid"})
+        sessions = FakeSessions(get_status=200)
+        await _tick(store, sessions)
+        # reminder → the Reminders cid; silent warm → None
+        assert ("follow_up_scan", {}, "cid") in store.enqueued
+        assert ("repo_presync", {}, None) in store.enqueued
+        assert set(store.advanced) == {("s1", 86400), ("s3", 3600)}
+
+    async def test_unrunnable_kind_is_advanced_but_not_enqueued(self):
+        # Finding-3 fix: a stale reminder row whose client is absent this boot must be
+        # advanced (so it doesn't re-fire immediately) but NOT enqueued (no fire-and-fail).
+        due = [
+            {"id": "s1", "name": "follow_up_scan", "kind": "follow_up_scan",
+             "spec": {}, "interval_seconds": 86400},   # NOT runnable this boot
+            {"id": "s3", "name": "repo_presync", "kind": "repo_presync",
+             "spec": {}, "interval_seconds": 3600},    # runnable
+        ]
+        store = FakeStore(due=due, settings={})
+        sessions = FakeSessions()
+        await _tick(store, sessions, runnable_kinds={"repo_presync"})
+        assert store.enqueued == [("repo_presync", {}, None)]   # only the runnable one ran
+        assert set(store.advanced) == {("s1", 86400), ("s3", 3600)}  # both advanced
+        assert sessions.created == 0
+
 
 class TestDefaultSchedules:
     def test_builds_two_reminder_schedules(self):
@@ -210,6 +263,24 @@ class TestDefaultSchedules:
         assert by_name["follow_up_scan"]["kind"] == "follow_up_scan"
         assert by_name["follow_up_scan"]["interval_seconds"] == 111
         assert by_name["resume_freshness"]["interval_seconds"] == 222
+
+    def test_seeds_repo_presync_when_interval_given(self):
+        # Slice E — a positive presync interval seeds the third (repo_presync) schedule.
+        defs = default_schedules(111, 222, 333)
+        by_name = {d["name"]: d for d in defs}
+        assert set(by_name) == {"follow_up_scan", "resume_freshness", "repo_presync"}
+        assert by_name["repo_presync"]["kind"] == "repo_presync"
+        assert by_name["repo_presync"]["interval_seconds"] == 333
+        assert by_name["repo_presync"]["spec"] == {}
+
+    def test_zero_interval_skips_that_kind(self):
+        # 0 means "client absent → do not seed" — the gate passes 0 for a kind whose
+        # client is missing, so no schedule is seeded that would only fail.
+        only_presync = default_schedules(0, 0, 333)
+        assert {d["name"] for d in only_presync} == {"repo_presync"}
+        no_presync = default_schedules(111, 222, 0)
+        assert {d["name"] for d in no_presync} == {"follow_up_scan", "resume_freshness"}
+        assert default_schedules(0, 0, 0) == []
 
 
 class TestRunSchedulerLoop:

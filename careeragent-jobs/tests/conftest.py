@@ -29,6 +29,8 @@ os.environ.setdefault("SESSIONS_URL", "http://careeragent-sessions:8005")
 os.environ.setdefault("SESSIONS_API_KEY", "test-sessions-key")
 os.environ.setdefault("REVIEW_URL", "http://careeragent-review:8007")
 os.environ.setdefault("REVIEW_API_KEY", "test-review-key")
+os.environ.setdefault("CODE_URL", "http://careeragent-code:8012")
+os.environ.setdefault("CODE_API_KEY", "test-code-key")
 
 import pytest  # noqa: E402
 

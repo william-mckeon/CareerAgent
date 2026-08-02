@@ -12,6 +12,7 @@ import pytest
 from jobtypes import (
     Deps,
     handle_follow_up_scan,
+    handle_repo_presync,
     handle_resume_freshness,
     handle_review_repos,
 )
@@ -153,3 +154,57 @@ class TestHandleResumeFreshness:
     async def test_dossier_error_raises(self):
         with pytest.raises(Exception):
             await handle_resume_freshness({}, _deps(FakeDossier(0, {"error": "refused"})))
+
+
+class FakeCode:
+    """Records the refresh call and returns a canned (status, body)."""
+
+    def __init__(self, status, body):
+        self._status = status
+        self._body = body
+        self.calls = []
+
+    async def refresh(self, limit=None):
+        self.calls.append({"limit": limit})
+        return self._status, self._body
+
+
+class TestHandleRepoPresync:
+    async def test_success_is_silent(self):
+        # A 2xx warm returns "" so the worker marks done and SKIPS the inject —
+        # a nightly cache warm never posts to the Reminders conversation.
+        code = FakeCode(200, {"discovered": 4, "refreshed": 4, "skipped": 0, "errors": 0,
+                              "repos": ["me/a"], "bytes": 100})
+        out = await handle_repo_presync({}, Deps(review=None, code=code))
+        assert out == ""
+        assert code.calls == [{"limit": None}]
+
+    async def test_forwards_limit_from_spec(self):
+        code = FakeCode(200, {"discovered": 1, "refreshed": 1, "skipped": 0, "errors": 0,
+                              "repos": ["me/a"], "bytes": 1})
+        await handle_repo_presync({"limit": 3}, Deps(review=None, code=code))
+        assert code.calls == [{"limit": 3}]
+
+    async def test_per_repo_errors_still_silent_success(self):
+        # A sweep that hit some per-repo errors is still a 2xx — NOT retried, still silent.
+        code = FakeCode(200, {"discovered": 5, "refreshed": 3, "skipped": 0, "errors": 2,
+                              "repos": ["me/a", "me/b", "me/c"], "bytes": 50})
+        assert await handle_repo_presync({}, Deps(review=None, code=code)) == ""
+
+    async def test_total_failure_raises(self):
+        # A non-2xx (e.g. GitHub discovery down → 502) RAISES so the worker retries.
+        code = FakeCode(502, {"detail": "GitHub unreachable"})
+        with pytest.raises(Exception) as exc:
+            await handle_repo_presync({}, Deps(review=None, code=code))
+        assert "GitHub unreachable" in str(exc.value)
+
+    async def test_transport_error_raises(self):
+        code = FakeCode(0, {"error": "ConnectError: refused"})
+        with pytest.raises(Exception) as exc:
+            await handle_repo_presync({}, Deps(review=None, code=code))
+        assert "refused" in str(exc.value)
+
+    async def test_missing_code_client_raises(self):
+        with pytest.raises(Exception) as exc:
+            await handle_repo_presync({}, Deps(review=None, code=None))
+        assert "code" in str(exc.value).lower()

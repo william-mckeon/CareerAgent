@@ -19,8 +19,11 @@ Kinds:
   ``follow_up_scan``   (#18b) — applications whose follow-up date has arrived.
   ``resume_freshness`` (#18b) — applications whose saved résumé is now stale.
 """
+import logging
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List
+
+logger = logging.getLogger("careeragent-jobs")
 
 # A reminder scan never lists more than this many applications inline — keeps an
 # injected reminder readable (and bounds the message size) when a user has a huge
@@ -33,10 +36,12 @@ class Deps:
     """Leaf-service clients a handler may use. Bundled so the worker can pass one
     object and new kinds can add fields without touching the loop signature.
 
-    ``dossier`` is optional (None) so a deployment missing the dossier key still
-    starts and runs review_repos; a reminder handler raises cleanly if it's None."""
+    ``dossier``/``code`` are optional (None) so a deployment missing that key still
+    starts and runs the kinds that don't need it; a handler that needs a missing
+    client raises cleanly (→ retry/fail)."""
     review: Any  # client.review.ReviewClient (duck-typed so tests can pass a fake)
     dossier: Any = None  # client.dossier.DossierClient (only the reminder kinds need it)
+    code: Any = None  # client.code.CodeClient (only repo_presync needs it — Slice E)
 
 
 async def handle_review_repos(spec: Dict[str, Any], deps: Deps) -> str:
@@ -77,6 +82,36 @@ def _require_dossier(deps: Deps) -> Any:
     if deps.dossier is None:
         raise RuntimeError("dossier client is not configured for this job kind")
     return deps.dossier
+
+
+def _require_code(deps: Deps) -> Any:
+    if deps.code is None:
+        raise RuntimeError("code client is not configured for this job kind")
+    return deps.code
+
+
+async def handle_repo_presync(spec: Dict[str, Any], deps: Deps) -> str:
+    """Slice E — the nightly cache warm. Ask careeragent-code to discover the user's
+    repos and clone-or-pull each into its cache, so the first deep code review of the
+    day is warm instead of a cold clone. This does NOT change the on-demand path: a
+    review always still pulls latest.
+
+    Returns the EMPTY string on success so the worker marks the job done and SKIPS the
+    inject — a cache warm is silent, it never posts to the "🔔 Reminders" conversation.
+    A per-repo failure inside the sweep is already counted by careeragent-code (a 2xx
+    body with an ``errors`` count) and is NOT retried. Only a TOTAL failure (careeragent-
+    code unreachable / non-2xx, e.g. GitHub discovery down) RAISES, so the worker's
+    retry_or_fail retries it — otherwise a transient outage just no-ops until the next
+    nightly tick."""
+    code = _require_code(deps)
+    status, body = await code.refresh(limit=spec.get("limit"))
+    if 200 <= status < 300 and isinstance(body, dict):
+        logger.info("repo_presync ok — discovered=%s refreshed=%s skipped=%s errors=%s",
+                    body.get("discovered"), body.get("refreshed"),
+                    body.get("skipped"), body.get("errors"))
+        return ""   # silent success — nothing to inject
+    detail = body.get("error") or body.get("detail") if isinstance(body, dict) else body
+    raise RuntimeError(f"repo pre-sync failed (status={status}): {detail}")
 
 
 async def _scan_applications(deps: Deps, **filters: Any) -> List[Dict[str, Any]]:
@@ -142,4 +177,5 @@ HANDLERS: Dict[str, Callable[[Dict[str, Any], Deps], Awaitable[str]]] = {
     "review_repos": handle_review_repos,
     "follow_up_scan": handle_follow_up_scan,
     "resume_freshness": handle_resume_freshness,
+    "repo_presync": handle_repo_presync,
 }

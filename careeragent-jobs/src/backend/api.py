@@ -28,6 +28,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Security
 from fastapi.responses import JSONResponse
 
+from client.code import CodeClient
 from client.dossier import DossierClient
 from client.review import ReviewClient
 from client.sessions import SessionsClient
@@ -57,6 +58,10 @@ SESSIONS_URL = os.environ.get("SESSIONS_URL", "http://careeragent-sessions:8005"
 SESSIONS_API_KEY = os.environ.get("SESSIONS_API_KEY", "").strip()
 DOSSIER_URL = os.environ.get("DOSSIER_URL", "http://careeragent-dossier:8006").strip().rstrip("/")
 DOSSIER_API_KEY = os.environ.get("DOSSIER_API_KEY", "").strip()
+# careeragent-code (Slice E, OPTIONAL) — the nightly repo cache-warm target. Jobs
+# carries only CODE_API_KEY; the GitHub PAT stays inside careeragent-code.
+CODE_URL = os.environ.get("CODE_URL", "http://careeragent-code:8012").strip().rstrip("/")
+CODE_API_KEY = os.environ.get("CODE_API_KEY", "").strip()
 
 
 def _int_env(name: str, default: int) -> int:
@@ -76,12 +81,16 @@ SCHEDULER_ENABLED = os.environ.get("JOBS_SCHEDULER_ENABLED", "true").strip().low
 SCHEDULER_TICK_SECONDS = float(_int_env("JOBS_SCHEDULER_TICK_SECONDS", 60))
 FOLLOW_UP_INTERVAL_SECONDS = _int_env("JOBS_FOLLOW_UP_INTERVAL_SECONDS", 86400)
 FRESHNESS_INTERVAL_SECONDS = _int_env("JOBS_FRESHNESS_INTERVAL_SECONDS", 86400)
+# Slice E — nightly repo cache-warm cadence (kind repo_presync). Seeded only when
+# careeragent-code is configured.
+PRESYNC_INTERVAL_SECONDS = _int_env("JOBS_PRESYNC_INTERVAL_SECONDS", 86400)
 
 # Module-level singletons, created in lifespan.
 store: Optional[Store] = None
 review_client: Optional[ReviewClient] = None
 sessions_client: Optional[SessionsClient] = None
 dossier_client: Optional[DossierClient] = None
+code_client: Optional[CodeClient] = None
 _worker_task: Optional[asyncio.Task] = None
 _scheduler_task: Optional[asyncio.Task] = None
 _stop_event: Optional[asyncio.Event] = None
@@ -104,7 +113,7 @@ def _public(job: dict) -> dict:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global store, review_client, sessions_client, dossier_client
+    global store, review_client, sessions_client, dossier_client, code_client
     global _worker_task, _scheduler_task, _stop_event
     store = Store()
     db_ok = await store.ping()
@@ -142,12 +151,24 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         dossier_client = None
         logger.warning("DossierClient unavailable (reminder jobs will fail): %s", exc)
+    # careeragent-code (Slice E) is OPTIONAL — build it only if a key is configured,
+    # defensively, so a missing/broken code service never blocks startup.
+    if CODE_API_KEY:
+        try:
+            code_client = CodeClient(url=CODE_URL, api_key=CODE_API_KEY)
+            await code_client.start()
+        except Exception as exc:
+            code_client = None
+            logger.warning("CodeClient unavailable (repo pre-sync will fail): %s", exc)
+    else:
+        logger.info("careeragent-code not configured (CODE_API_KEY unset) — no repo pre-sync")
 
     _stop_event = asyncio.Event()
     if review_client is not None and sessions_client is not None:
-        # dossier_client may be None — review_repos still works; only the reminder
-        # kinds need it and they raise cleanly (→ retry/fail) if it's absent.
-        deps = Deps(review=review_client, dossier=dossier_client)
+        # dossier_client / code_client may be None — review_repos still works; only the
+        # reminder kinds need dossier and only repo_presync needs code, and each raises
+        # cleanly (→ retry/fail) if its client is absent.
+        deps = Deps(review=review_client, dossier=dossier_client, code=code_client)
         _worker_task = asyncio.create_task(
             run_worker_loop(store, HANDLERS, deps, sessions_client,
                             POLL_SECONDS, MAX_ATTEMPTS, stop_event=_stop_event)
@@ -155,19 +176,25 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("worker NOT started — a required outbound client is missing")
 
-    # Scheduler (P7 #18b) — enqueues recurring reminder jobs. Requires the worker
-    # (to drain what it enqueues), sessions (the Reminders conversation), and
-    # dossier (the reminder handlers read it). Skipped otherwise so it never
-    # enqueues work nothing can run.
-    if (SCHEDULER_ENABLED and _worker_task is not None
-            and sessions_client is not None and dossier_client is not None):
-        defaults = default_schedules(FOLLOW_UP_INTERVAL_SECONDS, FRESHNESS_INTERVAL_SECONDS)
+    # Scheduler (P7 #18b + Slice E) — enqueues recurring jobs. Requires the worker (to
+    # drain what it enqueues) and sessions (the Reminders conversation). Each recurring
+    # KIND is seeded only when the client it needs is present: the reminder scans need
+    # dossier, the repo_presync warm needs code. A 0 interval → that kind is not seeded,
+    # so the scheduler never enqueues work nothing can run. Start it as long as at least
+    # ONE kind is runnable (so a dossier outage doesn't also pause the code warm).
+    if (SCHEDULER_ENABLED and _worker_task is not None and sessions_client is not None
+            and (dossier_client is not None or code_client is not None)):
+        defaults = default_schedules(
+            FOLLOW_UP_INTERVAL_SECONDS if dossier_client is not None else 0,
+            FRESHNESS_INTERVAL_SECONDS if dossier_client is not None else 0,
+            PRESYNC_INTERVAL_SECONDS if code_client is not None else 0,
+        )
         _scheduler_task = asyncio.create_task(
             run_scheduler_loop(store, sessions_client, defaults,
                                SCHEDULER_TICK_SECONDS, stop_event=_stop_event)
         )
     elif SCHEDULER_ENABLED:
-        logger.warning("scheduler NOT started — worker/sessions/dossier not all available")
+        logger.warning("scheduler NOT started — worker/sessions up and dossier-or-code needed")
     else:
         logger.info("scheduler disabled (JOBS_SCHEDULER_ENABLED=false)")
 
@@ -178,11 +205,13 @@ async def lifespan(app: FastAPI):
     logger.info("Review upstream       : %s", REVIEW_URL)
     logger.info("Sessions upstream     : %s", SESSIONS_URL)
     logger.info("Dossier upstream      : %s", DOSSIER_URL)
+    logger.info("Code upstream         : %s", CODE_URL if CODE_API_KEY else "not configured")
     logger.info("Worker                : %s (poll=%ss, max_attempts=%s)",
                 "running" if _worker_task else "disabled", POLL_SECONDS, MAX_ATTEMPTS)
-    logger.info("Scheduler             : %s (tick=%ss, follow_up=%ss, freshness=%ss)",
+    logger.info("Scheduler             : %s (tick=%ss, follow_up=%ss, freshness=%ss, presync=%s)",
                 "running" if _scheduler_task else "disabled",
-                SCHEDULER_TICK_SECONDS, FOLLOW_UP_INTERVAL_SECONDS, FRESHNESS_INTERVAL_SECONDS)
+                SCHEDULER_TICK_SECONDS, FOLLOW_UP_INTERVAL_SECONDS, FRESHNESS_INTERVAL_SECONDS,
+                f"{PRESYNC_INTERVAL_SECONDS}s" if code_client is not None else "off")
     logger.info("API docs (/docs)      : %s", "enabled" if ENABLE_DOCS else "disabled")
     logger.info("=== careeragent-jobs ready on :%s ===", PORT)
     yield
@@ -206,6 +235,8 @@ async def lifespan(app: FastAPI):
         await sessions_client.stop()
     if dossier_client is not None:
         await dossier_client.stop()
+    if code_client is not None:
+        await code_client.stop()
     await store.stop()
     logger.info("=== careeragent-jobs shutting down ===")
 
