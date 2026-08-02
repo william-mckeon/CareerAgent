@@ -42,6 +42,11 @@ SLASH_COMMANDS: Dict[str, Dict[str, str]] = {
     "linkedin-review": {"expand": "Review my LinkedIn profile extensively. Use your `linkedin-review` skill."},
     "recommend-jobs": {"expand": "Find and score real open roles that fit me, and recommend the best. "
                                  "Use your `recommend-jobs` skill."},
+    "deep-review": {"expand": "Do a DEEP, line-level review of my repo's ACTUAL code (not just the "
+                              "README) and turn it into truthful, specific portfolio/résumé material. "
+                              "Use your `deep-code-review` skill."},
+    "content-ideas": {"expand": "Turn my real code into grounded X/social post ideas, mindful of what "
+                                "I've already posted. Use your `code-content-ideas` skill."},
     # ------- action commands (invoke a capability directly, no skill body) -------
     "review-repos": {"expand": "Kick off a background review of my GitHub repositories to refresh my "
                                "projects library. Run it as a background job so I don't have to wait — "

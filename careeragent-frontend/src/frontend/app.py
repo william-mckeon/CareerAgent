@@ -1422,7 +1422,7 @@ if _upload_seed and not _pending:
 
 if not _pending:
     st.caption("Playbooks: **/tailor** · **/ats-check** · **/quantify-bullets** · **/cover-letter** "
-               "· **/linkedin-review** · **/recommend-jobs**  "
+               "· **/linkedin-review** · **/recommend-jobs** · **/deep-review** · **/content-ideas**  "
                "· Actions: **/fetch** _url_ · **/review-repos** · **/reminders** · **/plan** _then your task_")
 
 if prompt := st.chat_input("Type your answer…" if _pending else "Message CareerAgent..."):

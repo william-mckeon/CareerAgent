@@ -52,6 +52,17 @@ class TestExpandSlash:
         assert "recommend-jobs` skill" in text
         assert mode is None
 
+    def test_deep_review_invokes_skill(self):
+        text, mode = expand_slash("/deep-review william-mckeon/openagent-code")
+        assert "deep-code-review` skill" in text
+        assert text.endswith("william-mckeon/openagent-code")   # repo appended as detail
+        assert mode is None
+
+    def test_content_ideas_invokes_skill(self):
+        text, mode = expand_slash("/content-ideas")
+        assert "code-content-ideas` skill" in text
+        assert mode is None
+
     def test_fetch_passes_url_through(self):
         text, mode = expand_slash("/fetch https://greenhouse.io/acme/jobs/123")
         assert text.startswith("Fetch this job posting")
