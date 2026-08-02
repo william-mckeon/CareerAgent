@@ -1,0 +1,10 @@
+# ============================================================================
+# careeragent-code - Python dependencies (runtime)
+# ============================================================================
+# The read-only code workspace: a FastAPI app that shells out to `git` (clone
+# --depth 1 / fetch) and `ripgrep` (search). Those two binaries come from the
+# image's apt layer, NOT pip — so the Python deps are tiny. No database, no ML,
+# NO model calls, no outbound HTTP client (git does the cloning).
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-dotenv>=1.0.0

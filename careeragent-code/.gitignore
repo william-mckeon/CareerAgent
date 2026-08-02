@@ -1,0 +1,12 @@
+# Local env / secrets (never commit the real one)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local clone cache (if ever run outside Docker)
+cache/

@@ -1,0 +1,37 @@
+# =============================================================================
+# careeragent-code — the read-only code workspace (port 8012) + a cache volume.
+#
+# Clones the user's repos on demand into `code-cache` and serves read-only file
+# tools over them, so the coach can review code at the LINE level instead of the
+# github-MCP's 6 KB-capped API straw. Holds the read-only GitHub PAT so
+# careeragent-api stays credential-less. NEVER executes cloned code.
+#
+# Prereqs:
+#   docker network create careeragent-network     # once, shared by all services
+#   cp .env.example .env  &&  edit .env            # CODE_API_KEY + read-only GITHUB_PAT
+#   docker compose up -d --build
+# =============================================================================
+
+services:
+  careeragent-code:
+    build:
+      context: .
+      dockerfile: docker/code/Dockerfile
+    image: careeragent-code:1.0.0
+    container_name: careeragent-code
+    env_file:
+      - .env
+    ports:
+      - "8012:8012"
+    volumes:
+      - code-cache:/cache
+    networks:
+      - careeragent-network
+    restart: unless-stopped
+
+volumes:
+  code-cache:
+
+networks:
+  careeragent-network:
+    external: true
