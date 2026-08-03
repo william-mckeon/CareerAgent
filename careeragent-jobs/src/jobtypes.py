@@ -58,13 +58,21 @@ async def handle_review_repos(spec: Dict[str, Any], deps: Deps) -> str:
         force=bool(spec.get("force")),
     )
     if 200 <= status < 300 and isinstance(body, dict) and "reviewed" in body:
-        reviewed = body.get("reviewed", 0)
-        skipped = body.get("skipped", 0)
-        errors = body.get("errors", 0)
-        return (
-            f"✅ Background repo review complete — reviewed {reviewed}, "
-            f"skipped {skipped}, {errors} error(s). Your projects library is updated."
-        )
+        reviewed = int(body.get("reviewed", 0) or 0)
+        skipped = int(body.get("skipped", 0) or 0)
+        errors = int(body.get("errors", 0) or 0)
+        # Report HONESTLY — don't imply new work when nothing changed. "reviewed" counts
+        # repos actually re-read this run; "skipped" were already up to date; "errors" failed.
+        err_tail = f", {errors} failed" if errors else ""
+        if reviewed > 0:
+            return (f"✅ Repo review done — {reviewed} project{'s' if reviewed != 1 else ''} "
+                    f"refreshed in your library ({skipped} already up to date{err_tail}).")
+        if errors and skipped == 0:
+            # Nothing succeeded — surface it as a problem, not a tidy success.
+            raise RuntimeError(f"repo review failed for all repos ({errors} error(s))")
+        base = (f"Repo review ran — nothing new to add: all {skipped} repo"
+                f"{'s' if skipped != 1 else ''} were already up to date{err_tail}.")
+        return base + " Ask me to draft LinkedIn/portfolio content from them, or to deep-review one."
     detail = body.get("detail") or body.get("error") if isinstance(body, dict) else body
     raise RuntimeError(f"review-batch failed (status={status}): {detail}")
 

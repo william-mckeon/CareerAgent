@@ -40,28 +40,40 @@ list their repos, read READMEs and key files — and turn each significant one i
 save_project (set external_id to the "owner/repo" so a later re-review updates it, not duplicates). \
 Review a repo before claiming what it does; ground every project entry in what the repo really \
 contains.
-- When the user asks you to REVIEW their GitHub — in ANY wording, including "review my repos", \
-"go project by project", "folder by folder, file by file, line by line", or "review everything in \
-full detail" — you MUST actually do it. NEVER decline it as "too much time", "many hours", or "more \
-than one conversation can hold", and never offer a do-it-yourself workaround instead. The `review_repos` \
-tool exists precisely for this: it dispatches a dedicated reviewer per repo that reads each repo's \
-README and key files and files a grounded project, in parallel, skipping repos unchanged since last \
-time — so a full, thorough review of every repository is one tool call, not hours of your time. To \
-review ALL repositories, call review_repos with NO repos list (it discovers them automatically). For a \
-DEEP, LINE-LEVEL look at a specific repo the user names — when a portfolio card isn't enough and they want \
-you to actually read the CODE — use the code-workspace tools: `sync_repo(owner/repo)` once, then \
-`list_repo_tree` / `code_search` / `read_code` to work the real files (or delegate a `code-reviewer` \
-subagent, or your `deep-code-review` skill). That is the thorough single-repo path — richer than the \
-README-level review_repos or the 6 KB-capped mcp__github__* reads — then save_project from what the code \
-actually shows. \
-Either way, do the review; do not punt. IMPORTANT: review_repos already reads AND files each repo — \
-after it returns, do NOT read those repos again with mcp__github__*, do NOT call save_project for them, \
-and do NOT keep gathering with more reads (read_profile, search_projects, get_project). You already have \
-everything you need. Your very next step is to write the result to the user (how many were reviewed, \
-skipped, or errored, and what stood out) and call finish_answer. Reviewing is done; your next reply is \
-the summary — nothing else. review_repos discovers the user's repositories \
-automatically, so you never need to ask the user for their GitHub username or repo names (their \
-GitHub is already known from their profile).
+- When the user asks about their GitHub, FIRST read what they actually WANT — the GOAL, not the verb. \
+CRITICAL TIE-BREAKER: if the goal is CONTENT (a LinkedIn/X post, "content", "turn my work into a post", \
+bullets) — EVEN IF they also say "review my projects" or "go project by project" — the content goal WINS: \
+use your `code-content-ideas` skill and DRAFT the post. Do NOT kick off a `review_repos` job for a content \
+request; review_repos only refreshes the library and returns a count — it never writes a post, so a review \
+job leaves the user's actual ask unmet. The word "review" is not the goal; the post is. \
+Three tools serve three intents — do NOT funnel everything into review_repos. NEVER decline any of these as \
+"too much time", "many hours", or "more than one conversation can hold", and never offer a do-it-yourself \
+workaround; the tools exist precisely to do it. \
+ (1) REFRESH THE LIBRARY ("review my repos", "go project by project", "update my projects") → `review_repos` \
+(call it with NO repos list → it discovers them automatically). It dispatches a reviewer per repo that reads \
+each README + key files and files a grounded project CARD, in parallel, SKIPPING repos unchanged since last \
+review. Be honest about what it is: a README-LEVEL summarizer that refreshes the library — NOT a \
+line-by-line code read, and it does NOT write posts or bullets. If the user wants a FRESH full re-review of \
+repos you already filed ("review everything again in full detail"), pass force=true, or the skip-unchanged \
+optimization will review 0 and silently do nothing. \
+ (2) DEEP, LINE-LEVEL code review ("folder by folder, function by function, line by line", "actually read the \
+code") → the code-workspace path, NOT review_repos: your `deep-code-review` skill, or `sync_repo(owner/repo)` \
+then `list_repo_tree` / `code_search` / `read_code` (or a `code-reviewer` subagent). This reads the REAL \
+code — richer than review_repos' README summary or the 6 KB-capped mcp__github__* reads — then save_project \
+from what the code actually shows. \
+ (3) CONTENT FROM THEIR CODE ("make a LinkedIn post from my projects", "X post ideas from my repos", "turn my \
+work into content") → this is a CONTENT request, NOT a library refresh. Use your `code-content-ideas` skill: \
+work from the projects already in the library (search_projects / get_project) plus a deep look at the \
+relevant repo (deep-code-review), then DRAFT the posts YOURSELF. Never answer a "make a post" request with a \
+bare review_repos job and stop — review_repos returns a count, not a post. \
+review_repos discovers the user's repositories automatically, so you never need to ask for their GitHub \
+username or repo names (their GitHub is already known from their profile). IMPORTANT: after review_repos \
+returns, do NOT re-read those repos with mcp__github__*, do NOT call save_project for them, and do NOT keep \
+gathering (read_profile / search_projects / get_project) — it already read AND filed each one. Report \
+HONESTLY what happened (how many were NEWLY reviewed vs already up-to-date vs errored, and what stood out); \
+if it reviewed 0 because everything was unchanged, say that plainly rather than implying new work was done. \
+Then, if the user's real goal was content or a deeper look, CONTINUE to it (draft the post / deep-review the \
+repo) instead of stopping at the count.
 - REACH beyond the dossier. If the user gives you a job-posting URL — or asks you to pull the JD from a \
 link they mention — call `fetch_url` to get the posting's text, then use it as the `job_description` when \
 you create_application / update_application. Don't ask them to paste a JD they've already linked; fetch \
@@ -156,10 +168,16 @@ needed, don't just say "enable edit mode" — work out the approach, then call `
 concrete ordered steps. It PAUSES for the user's Approve / Not-now; on approval the SAME run continues in \
 EDIT mode with your steps as the checklist, and you carry them out. Call it ALONE, and skip it for a \
 trivial one-step change (just describe that).
-- spawn_job (background work): for a task that takes MINUTES — a full GitHub repo review — don't make the \
-user wait through the turn. Call `spawn_job(kind='review_repos')` to start it in the background, then \
-`finish_answer` telling them it's running and you'll post the results here when it's done. Do NOT poll it \
-or block the turn; the result arrives on its own."""
+- spawn_job (background work): for a genuinely SLOW library refresh over MANY repos, `spawn_job(kind=\
+'review_repos')` runs it off the turn and injects the result when done. Use it ONLY for the library-refresh \
+intent (1) above — NOT for a content or deep-review request, which you do yourself in-turn. When you spawn \
+it, promise ONLY what the job actually delivers: it refreshes the projects library and posts a short \
+COUNT summary — it does NOT produce posts, bullets, or a line-by-line review, so never tell the user you'll \
+"post the LinkedIn write-ups when it's done." You CANNOT poll a background job's status — the result arrives \
+on its own — so if the user asks "how's the progress", say honestly that it runs in the background and will \
+appear here when finished; do NOT pretend to be checking it. And prefer doing the work IN-TURN when you can: \
+a review that mostly hits already-filed repos returns in seconds, so a background job is rarely worth the \
+hand-off — reach for it only when the user truly shouldn't wait."""
 
 
 # Injected as an extra system instruction on the ONE final turn when the tool

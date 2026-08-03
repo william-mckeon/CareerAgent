@@ -45,12 +45,15 @@ SLASH_COMMANDS: Dict[str, Dict[str, str]] = {
     "deep-review": {"expand": "Do a DEEP, line-level review of my repo's ACTUAL code (not just the "
                               "README) and turn it into truthful, specific portfolio/résumé material. "
                               "Use your `deep-code-review` skill."},
-    "content-ideas": {"expand": "Turn my real code into grounded X/social post ideas, mindful of what "
-                                "I've already posted. Use your `code-content-ideas` skill."},
+    "content-ideas": {"expand": "Turn my real code/projects into grounded LinkedIn (or X/social) post ideas "
+                                "AND draft the best one, mindful of what I've already posted. Use your "
+                                "`code-content-ideas` skill."},
     # ------- action commands (invoke a capability directly, no skill body) -------
-    "review-repos": {"expand": "Kick off a background review of my GitHub repositories to refresh my "
-                               "projects library. Run it as a background job so I don't have to wait — "
-                               "post the results here when it's done."},
+    "review-repos": {"expand": "Refresh my projects library from my GitHub repositories (a README-level "
+                               "pass that files/updates a project card per repo). If most are already "
+                               "up to date it's quick — do it now and summarize honestly what changed; "
+                               "only hand it to a background job if it's genuinely slow. This refreshes the "
+                               "library; it does NOT write posts — for that I'll ask for content-ideas."},
     "reminders": {"expand": "Check my application tracker right now: which applications are due for a "
                             "follow-up (their follow-up date has arrived or passed), and which saved "
                             "résumés are stale versus my current profile? Summarize what needs attention."},

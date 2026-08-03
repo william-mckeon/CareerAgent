@@ -38,19 +38,32 @@ class TestHandleReviewRepos:
             {"repos": ["a/b"], "limit": 5, "focus": "backend", "force": True},
             Deps(review=review),
         )
-        assert "reviewed 3" in summary
-        assert "skipped 1" in summary
-        assert "0 error(s)" in summary
-        assert "projects library is updated" in summary
+        assert "3 projects refreshed" in summary
+        assert "1 already up to date" in summary
         # spec was forwarded verbatim to the review client.
         assert review.calls == [
             {"repos": ["a/b"], "limit": 5, "focus": "backend", "force": True}
         ]
 
-    async def test_missing_spec_fields_default_cleanly(self):
+    async def test_zero_reviewed_reports_honestly_not_a_tidy_success(self):
+        # The bug from the field: all repos skipped + 1 error must NOT read as
+        # "complete, library updated" — it says nothing new happened, and points onward.
+        review = FakeReview(200, {"reviewed": 0, "skipped": 9, "errors": 1})
+        summary = await handle_review_repos({}, Deps(review=review))
+        assert "nothing new" in summary and "9" in summary and "1 failed" in summary
+        assert "refreshed in your library" not in summary   # not a false success
+        assert "draft" in summary.lower()                    # points the user to the real next step
+
+    async def test_all_failed_raises(self):
+        # 0 reviewed, 0 skipped, all errors → a real failure, surfaced (not a happy summary).
+        review = FakeReview(200, {"reviewed": 0, "skipped": 0, "errors": 3})
+        with pytest.raises(Exception):
+            await handle_review_repos({}, Deps(review=review))
+
+    async def test_nothing_due_is_clean(self):
         review = FakeReview(200, {"reviewed": 0, "skipped": 0, "errors": 0})
         summary = await handle_review_repos({}, Deps(review=review))
-        assert "reviewed 0" in summary
+        assert "nothing new" in summary
         assert review.calls == [{"repos": None, "limit": None, "focus": None, "force": False}]
 
     async def test_non_2xx_raises(self):
